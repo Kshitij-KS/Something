@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Callback Capture",
+  "version": "0.1.0",
+  "description": "Local capture bridge for Callback.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxMLdYIfHGSBJfsPOqQoANUvsKouxC2fU5tQNgh8NQHlOpfs6S40pcccjHaZ+kIbFrwDCPu9S+yYaKbpgs40ExrFNHul1DZX47e1ZkQW7ODfROsbbohq69cSAB6jxAEJolaqWWdfGIJAg6r5+S3zrvh0nTHNcxboF7LNiQCSIRE5oaI6nBj7iZidR3qf6y3lx9n6lf/P3teJmVMo6fVx4k9WM6k2Xn9qaJE/Jbldk01A6rVOAqjhjWSpmqadvkaOOUFFFSqByUYe2v5/Lt1fPIGJX9p0z3oD0uHdCe858dX17ccR9gds3mtR/KofNN4ey2bKc0zyiI4RsU42xxL6XeQIDAQAB",
+  "permissions": ["nativeMessaging", "storage"],
+  "host_permissions": ["https://mail.google.com/*", "https://app.slack.com/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://mail.google.com/*", "https://app.slack.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

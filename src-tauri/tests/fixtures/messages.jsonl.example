@@ -1,0 +1,2 @@
+{"id":"example-1","source":"slack","text":"I will send the invoice tomorrow","label":"promise"}
+{"id":"example-2","source":"gmail","text":"Can you send the invoice?","label":"not_promise"}

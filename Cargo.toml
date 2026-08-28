@@ -1,0 +1,38 @@
+[workspace]
+members = ["src-tauri", "crates/protocol", "crates/native-host"]
+default-members = ["src-tauri", "crates/protocol", "crates/native-host"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+unnested_or_patterns = "allow"
+match_same_arms = "allow"
+redundant_closure_for_method_calls = "allow"
+map_unwrap_or = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+items_after_statements = "allow"
+struct_excessive_bools = "allow"
+cast_possible_truncation = "allow"
+uninlined_format_args = "allow"
+missing_const_for_fn = "allow"
+module_name_repetitions = "allow"
+return_self_not_must_use = "allow"
+unused_self = "allow"
+ref_option = "allow"

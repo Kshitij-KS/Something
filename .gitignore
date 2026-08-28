@@ -1,0 +1,26 @@
+# JavaScript
+node_modules/
+dist/
+extension/dist/
+*.tsbuildinfo
+
+# Rust / Tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local-only data and secrets
+*.db
+*.db-shm
+*.db-wal
+*.pem
+*.key
+.env
+.env.*
+!.env.example

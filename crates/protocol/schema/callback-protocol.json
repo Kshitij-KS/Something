@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://callback.local/schema/callback-protocol.json",
+  "title": "Callback native protocol",
+  "type": "object",
+  "required": ["protocol_version", "kind", "id"],
+  "properties": {
+    "protocol_version": { "type": "integer", "const": 1 },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "handshake",
+        "capture",
+        "context",
+        "ack",
+        "probe",
+        "reconnect",
+        "error"
+      ]
+    },
+    "id": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}

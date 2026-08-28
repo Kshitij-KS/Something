@@ -1,0 +1,10 @@
+dist
+extension/dist
+node_modules
+target
+package-lock.json
+Cargo.lock
+callback-spec.md
+LICENSE
+src-tauri/icons
+src-tauri/gen

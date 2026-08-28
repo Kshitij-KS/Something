@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "gmail": {
+    "sendButton": [
+      "[role='button'][aria-label^='Send']",
+      "div[aria-label*='Send'][role='button']"
+    ],
+    "composeBody": [
+      "div[aria-label='Message Body']",
+      "div[g_editable='true'][role='textbox']"
+    ],
+    "composeContainer": ["div[role='dialog']", "div.M9"],
+    "toField": ["input[aria-label*='To']", "div[aria-label*='To']"],
+    "successProbe": ["div[aria-live='assertive']"]
+  },
+  "slack": {
+    "sendButton": [
+      "button[data-qa='texty_send_button']",
+      "button[aria-label='Send now']"
+    ],
+    "composeBody": [
+      "div[data-qa='message_input']",
+      "div[contenteditable='true'][role='textbox']"
+    ],
+    "channelContext": [
+      "div[data-qa='channel_name']",
+      "div[data-qa='dm_title']"
+    ],
+    "threadContext": ["div[data-qa='thread_view']"],
+    "workspace": ["button[data-qa='team-menu-trigger']"]
+  }
+}
