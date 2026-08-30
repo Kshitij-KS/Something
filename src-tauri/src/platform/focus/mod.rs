@@ -190,10 +190,15 @@ impl FocusDebouncer {
         }
     }
 
-    /// Cancels any in-flight dwell after lock or sleep.
-    pub fn on_lock_or_sleep(&mut self) -> DebounceOutcome {
+    /// Cancels any in-flight dwell and invalidates its generation.
+    pub fn cancel_pending(&mut self) -> DebounceOutcome {
         self.bump_generation();
         DebounceOutcome::Cancelled
+    }
+
+    /// Cancels any in-flight dwell after lock or sleep.
+    pub fn on_lock_or_sleep(&mut self) -> DebounceOutcome {
+        self.cancel_pending()
     }
 
     /// Forwards lock/unlock/sleep/resume into the debounce generation.

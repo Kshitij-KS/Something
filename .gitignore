@@ -2,12 +2,14 @@
 node_modules/
 dist/
 extension/dist/
+/artifacts/
 *.tsbuildinfo
 
 # Rust / Tauri
 target/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/binaries/
 
 # Editors and operating systems
 .idea/
@@ -19,6 +21,7 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+src-tauri/tests/fixtures/messages.jsonl
 *.pem
 *.key
 .env

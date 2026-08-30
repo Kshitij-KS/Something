@@ -74,17 +74,41 @@ pub fn write_frame<W: Write>(
 ///
 /// # Errors
 ///
-/// Returns [`ProtocolError`] for malformed, oversized, or truncated frames.
+/// Returns [`ProtocolError`] for malformed, oversized, truncated, or missing frames.
 pub fn read_frame<R: Read>(reader: &mut R, max: usize) -> Result<Vec<u8>, ProtocolError> {
+    read_frame_or_eof(reader, max)?.ok_or(ProtocolError::Malformed)
+}
+
+/// Reads one framed payload while treating EOF before a new prefix as a clean disconnect.
+///
+/// EOF after any prefix or payload byte remains malformed, so truncated frames are never
+/// accepted as graceful connection shutdown.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError`] for malformed, oversized, truncated, or failed reads.
+pub fn read_frame_or_eof<R: Read>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut len_buf = [0u8; 4];
-    read_exact_partial(reader, &mut len_buf)?;
+    loop {
+        match reader.read(&mut len_buf[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(_) => unreachable!("one-byte read returned more than one byte"),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(ProtocolError::Io),
+        }
+    }
+    read_exact_partial(reader, &mut len_buf[1..])?;
     let len = usize::try_from(u32::from_ne_bytes(len_buf)).map_err(|_| ProtocolError::Malformed)?;
     if len > max {
         return Err(ProtocolError::Oversized { max });
     }
     let mut payload = vec![0u8; len];
     read_exact_partial(reader, &mut payload)?;
-    Ok(payload)
+    Ok(Some(payload))
 }
 
 fn read_exact_partial<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<(), ProtocolError> {

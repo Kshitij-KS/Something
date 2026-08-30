@@ -1,0 +1,8 @@
+{
+  "build": {
+    "beforeBuildCommand": "npm run build:app && npm run stage:native-host"
+  },
+  "bundle": {
+    "externalBin": ["binaries/callback-native-host"]
+  }
+}

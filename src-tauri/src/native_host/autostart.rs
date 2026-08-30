@@ -19,7 +19,7 @@ pub fn autostart_reg_args(exe: &Path, enabled: bool) -> Vec<String> {
             "/t".into(),
             "REG_SZ".into(),
             "/d".into(),
-            exe.display().to_string(),
+            format!("\"{}\"", exe.display()),
             "/f".into(),
         ]
     } else {
@@ -37,20 +37,43 @@ pub fn autostart_reg_args(exe: &Path, enabled: bool) -> Vec<String> {
 ///
 /// # Errors
 ///
-/// Returns IO errors when `reg.exe` cannot be started.
+/// Returns an error when `reg.exe` cannot be started or rejects the update.
 pub fn apply_autostart(exe: &Path, enabled: bool) -> io::Result<bool> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        let status = std::process::Command::new("reg")
-            .args(autostart_reg_args(exe, enabled))
-            .creation_flags(0x0800_0000)
-            .status()?;
-        Ok(status.success())
+        if !enabled {
+            let query = run_reg(&[
+                "query".into(),
+                RUN_KEY.into(),
+                "/v".into(),
+                AUTOSTART_VALUE.into(),
+            ])?;
+            if !query.success() {
+                return Ok(true);
+            }
+        }
+
+        let status = run_reg(&autostart_reg_args(exe, enabled))?;
+        if status.success() {
+            Ok(true)
+        } else {
+            Err(io::Error::other(format!(
+                "reg.exe rejected the autostart update with {status}"
+            )))
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = (exe, enabled);
         Ok(false)
     }
+}
+
+#[cfg(windows)]
+fn run_reg(args: &[String]) -> io::Result<std::process::ExitStatus> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("reg")
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .status()
 }

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   acknowledge,
+  captureIdFor,
   enqueue,
   pending,
+  removeSource,
   type OutboxItem,
   type StorageAdapter,
 } from "../src/outbox";
@@ -19,10 +21,14 @@ function memory(): StorageAdapter {
   };
 }
 
-function item(id: string, bytes = 10): OutboxItem {
+function item(
+  id: string,
+  bytes = 10,
+  sourceApp: OutboxItem["sourceApp"] = "gmail",
+): OutboxItem {
   return {
     captureId: id,
-    sourceApp: "gmail",
+    sourceApp,
     rawMessage: "x".repeat(bytes),
     sentAt: Date.now(),
     bytes,
@@ -39,6 +45,57 @@ describe("durable outbox", () => {
     await acknowledge("cap-1", a);
     expect(await pending(a)).toEqual([]);
     expect((await pending(b)).map((row) => row.captureId)).toEqual(["cap-2"]);
+  });
+
+  it("serializes concurrent storage updates without losing captures", async () => {
+    const storage = memory();
+    await Promise.all([
+      enqueue(item("cap-concurrent-1"), storage),
+      enqueue(item("cap-concurrent-2"), storage),
+    ]);
+    expect((await pending(storage)).map((row) => row.captureId)).toEqual([
+      "cap-concurrent-1",
+      "cap-concurrent-2",
+    ]);
+  });
+
+  it("serializes concurrent source removals", async () => {
+    const storage = memory();
+    await enqueue(item("gmail-old"), storage);
+    await enqueue(item("slack-old", 10, "slack"), storage);
+
+    await Promise.all([
+      removeSource("gmail", storage),
+      removeSource("slack", storage),
+    ]);
+
+    expect(await pending(storage)).toEqual([]);
+  });
+
+  it("serializes source removal with enqueue", async () => {
+    const storage = memory();
+    await enqueue(item("gmail-old"), storage);
+    await enqueue(item("slack-old", 10, "slack"), storage);
+
+    await Promise.all([
+      removeSource("gmail", storage),
+      enqueue(item("slack-new", 10, "slack"), storage),
+    ]);
+
+    expect(
+      (await pending(storage)).map(({ captureId, sourceApp }) => ({
+        captureId,
+        sourceApp,
+      })),
+    ).toEqual([
+      { captureId: "slack-old", sourceApp: "slack" },
+      { captureId: "slack-new", sourceApp: "slack" },
+    ]);
+  });
+
+  it("keeps retries stable while distinguishing separate send intents", () => {
+    expect(captureIdFor("intent-a")).toBe(captureIdFor("intent-a"));
+    expect(captureIdFor("intent-a")).not.toBe(captureIdFor("intent-b"));
   });
 
   it("drops oldest items on overflow", async () => {

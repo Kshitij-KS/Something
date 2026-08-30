@@ -1,15 +1,14 @@
-//! Extracted-promise surfacing on a completed focus dwell.
+//! Extracted-promise surfacing on completed focus dwell and maintenance ticks.
 
-use crate::db::Database;
-use crate::domain::{LeaseState, SurfaceLease};
+use crate::db::{Database, DbError};
 use crate::platform::focus::FocusTarget;
-use crate::platform::notifications::{NotificationRequest, NotificationSink};
-use crate::surfacing::phase0::{Phase0Rule, notify_matched};
+use crate::platform::notifications::{NotificationRequest, NotificationSink, NotifyError};
+use crate::surfacing::phase0::{Phase0Rule, match_phase0, notify_matched};
 use crate::surfacing::rate_limit::{
     Eligibility, RateLimitConfig, RateLimitState, evaluate_candidate, local_day,
 };
 use crate::triggers::{Candidate, Trigger, TriggerKind, matching_priority, select_one};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Offset, Utc};
 
 /// What the dwell thread actually presented.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,27 +24,93 @@ pub enum DwellAction {
     None,
 }
 
+/// Work performed by one periodic maintenance pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaintenanceResult {
+    pub reopened_snoozes: u64,
+    pub deadline_surface: Option<DwellAction>,
+}
+
+/// Durable surfacing or OS delivery failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SurfaceError {
+    #[error(transparent)]
+    Database(#[from] DbError),
+    #[error(transparent)]
+    Notification(#[from] NotifyError),
+    #[error("{notification}; additionally failed to record delivery failure: {database}")]
+    NotificationFinalize {
+        notification: NotifyError,
+        database: DbError,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceCause {
+    Context,
+    Deadline,
+}
+
 /// Combines stored triggers with OS+extension focus, then surfaces at most one candidate.
-///
-/// # Errors
-///
-/// Returns a database error when matching, leasing, or settings lookup fails.
 pub fn handle_dwell(
     db: &Database,
     sink: &dyn NotificationSink,
     target: &FocusTarget,
     now: DateTime<Utc>,
     phase0_rules: &[Phase0Rule],
-) -> Result<DwellAction, crate::db::DbError> {
-    if let Some(action) = surface_extracted(db, sink, target, now)? {
-        return Ok(action);
+) -> Result<DwellAction, SurfaceError> {
+    // A due snooze is reopened by maintenance but remains ineligible until a
+    // newly completed dwell reaches this point.
+    db.clear_reopened_snooze_markers(now.timestamp())?;
+    if db.kill_gate_passed("extraction_precision_300")? {
+        if let Some(action) = surface_extracted(db, sink, target, now)? {
+            return Ok(action);
+        }
     }
-    if notify_matched(&target.app_id, phase0_rules, sink).unwrap_or(false) {
-        if let Some(rule) = crate::surfacing::phase0::match_phase0(&target.app_id, phase0_rules) {
+    if notify_matched(&target.app_id, phase0_rules, sink)? {
+        if let Some(rule) = match_phase0(&target.app_id, phase0_rules) {
             return Ok(DwellAction::Phase0Shown { rule_id: rule.id });
         }
     }
     Ok(DwellAction::None)
+}
+
+/// Reopens due snoozes and surfaces at most one never-shown due deadline.
+pub fn handle_maintenance_tick(
+    db: &Database,
+    sink: &dyn NotificationSink,
+    now: DateTime<Utc>,
+) -> Result<MaintenanceResult, SurfaceError> {
+    let reopened_snoozes = db.reopen_due_snoozes(now.timestamp())?;
+    let deadline_surface = if db.kill_gate_passed("extraction_precision_300")? {
+        let mut candidates = db
+            .list_due_deadline_candidates(now.timestamp())?
+            .into_iter()
+            .map(|row| Candidate {
+                promise_id: row.promise_id,
+                priority: 0,
+                deadline_ts: Some(row.deadline_ts),
+                confidence: row.confidence,
+                created_at: row.created_at,
+            })
+            .collect::<Vec<_>>();
+        match select_one(&mut candidates) {
+            Some(candidate) => Some(deliver_candidate(
+                db,
+                sink,
+                candidate,
+                now,
+                SurfaceCause::Deadline,
+            )?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(MaintenanceResult {
+        reopened_snoozes,
+        deadline_surface,
+    })
 }
 
 fn surface_extracted(
@@ -53,40 +118,65 @@ fn surface_extracted(
     sink: &dyn NotificationSink,
     target: &FocusTarget,
     now: DateTime<Utc>,
-) -> Result<Option<DwellAction>, crate::db::DbError> {
+) -> Result<Option<DwellAction>, SurfaceError> {
     let mut matched = matching_open_candidates(db, target, now.timestamp())?;
     let Some(winner) = select_one(&mut matched) else {
         return Ok(None);
     };
-    let (config, state) = load_policy(db, now)?;
-    let day = local_day(now, 0);
+    deliver_candidate(db, sink, winner, now, SurfaceCause::Context).map(Some)
+}
+
+fn deliver_candidate(
+    db: &Database,
+    sink: &dyn NotificationSink,
+    winner: Candidate,
+    now: DateTime<Utc>,
+    cause: SurfaceCause,
+) -> Result<DwellAction, SurfaceError> {
+    let (config, state, day) = load_policy(db, now)?;
     let already = db.promise_shown_on_day(winner.promise_id, &day)?;
-    match evaluate_candidate(now, &day, already, &config, &state) {
-        Eligibility::Suppress(_) => Ok(Some(DwellAction::Suppressed)),
-        Eligibility::Allow => {
-            let text = db
-                .promise_text(winner.promise_id)?
-                .unwrap_or_else(|| "Callback reminder".into());
-            let lease_token = uuid::Uuid::new_v4().to_string();
-            let action_token = uuid::Uuid::new_v4().to_string();
-            let mut lease = SurfaceLease::new(winner.promise_id, &lease_token, &action_token);
-            lease.state = LeaseState::Leased;
-            lease.expires_at = now.timestamp() + 15 * 60;
-            db.insert_lease(lease)?;
-            sink.show(&NotificationRequest {
-                title: "Callback".into(),
-                body: text,
-                action_token: action_token.clone(),
-            })
-            .map_err(|error| crate::db::DbError::InvalidSetting {
-                key: "notification".into(),
-                reason: error.to_string(),
-            })?;
-            db.mark_lease_shown(&lease_token, now.timestamp(), &day)?;
-            Ok(Some(DwellAction::ExtractedShown {
+    if matches!(
+        evaluate_candidate(now, &day, already, &config, &state),
+        Eligibility::Suppress(_)
+    ) {
+        return Ok(DwellAction::Suppressed);
+    }
+
+    let lease_token = uuid::Uuid::new_v4().to_string();
+    let action_token = uuid::Uuid::new_v4().to_string();
+    let surface_attempt_id = db.begin_notification_attempt(
+        winner.promise_id,
+        &lease_token,
+        &action_token,
+        now.timestamp(),
+        now.timestamp() + 15 * 60,
+    )?;
+    let request = NotificationRequest::actionable(&action_token);
+    match sink.show(&request) {
+        Ok(()) => {
+            db.finish_notification_delivered(
+                surface_attempt_id,
+                now.timestamp(),
+                &day,
+                matches!(cause, SurfaceCause::Deadline),
+            )?;
+            Ok(DwellAction::ExtractedShown {
                 promise_id: winner.promise_id,
                 action_token,
-            }))
+            })
+        }
+        Err(notification) => {
+            match db.finish_notification_failed(
+                surface_attempt_id,
+                now.timestamp(),
+                &notification.to_string(),
+            ) {
+                Ok(()) => Err(SurfaceError::Notification(notification)),
+                Err(database) => Err(SurfaceError::NotificationFinalize {
+                    notification,
+                    database,
+                }),
+            }
         }
     }
 }
@@ -95,7 +185,7 @@ fn matching_open_candidates(
     db: &Database,
     target: &FocusTarget,
     now_unix: i64,
-) -> Result<Vec<Candidate>, crate::db::DbError> {
+) -> Result<Vec<Candidate>, DbError> {
     let rows = db.list_surfaceable_rows(now_unix)?;
     let mut by_promise: Vec<Candidate> = Vec::new();
     for row in rows {
@@ -133,8 +223,9 @@ fn matching_open_candidates(
 fn load_policy(
     db: &Database,
     now: DateTime<Utc>,
-) -> Result<(RateLimitConfig, RateLimitState), crate::db::DbError> {
-    let day = local_day(now, 0);
+) -> Result<(RateLimitConfig, RateLimitState, String), DbError> {
+    let offset_seconds = configured_offset_seconds(db, now)?;
+    let day = local_day(now, offset_seconds);
     let daily_cap = db
         .get_setting("daily_surface_cap")?
         .and_then(|value| value.parse().ok())
@@ -178,7 +269,22 @@ fn load_policy(
         last_observed_now: last_surface_at.unwrap_or(now),
         active_surface: db.has_active_surface(now.timestamp())?,
     };
-    Ok((config, state))
+    Ok((config, state, day))
+}
+
+fn configured_offset_seconds(db: &Database, now: DateTime<Utc>) -> Result<i32, DbError> {
+    let timezone = db.get_setting("timezone")?.unwrap_or_else(|| "UTC".into());
+    let timezone = timezone
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| DbError::InvalidSetting {
+            key: "timezone".into(),
+            reason: "must be a valid IANA timezone".into(),
+        })?;
+    Ok(now
+        .with_timezone(&timezone)
+        .offset()
+        .fix()
+        .local_minus_utc())
 }
 
 fn parse_hh_mm(value: &str) -> Option<u32> {

@@ -173,3 +173,18 @@ impl std::io::Write for Combined {
         self.writer.flush()
     }
 }
+
+#[test]
+fn clean_eof_is_distinct_from_a_truncated_frame() {
+    let mut empty = Cursor::new(Vec::<u8>::new());
+    assert_eq!(
+        callback_protocol::read_frame_or_eof(&mut empty, HOST_TO_CHROME_MAX),
+        Ok(None)
+    );
+
+    let mut truncated = Cursor::new(vec![1_u8, 0]);
+    assert_eq!(
+        callback_protocol::read_frame_or_eof(&mut truncated, HOST_TO_CHROME_MAX),
+        Err(callback_protocol::ProtocolError::Malformed)
+    );
+}

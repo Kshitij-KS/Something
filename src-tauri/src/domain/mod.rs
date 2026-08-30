@@ -64,6 +64,18 @@ impl PromiseStatus {
         }
     }
 
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "review" => Ok(Self::Review),
+            "open" => Ok(Self::Open),
+            "snoozed" => Ok(Self::Snoozed),
+            "done" => Ok(Self::Done),
+            "dismissed" => Ok(Self::Dismissed),
+            "archived" => Ok(Self::Archived),
+            other => Err(format!("unsupported promise status {other}")),
+        }
+    }
+
     /// Routes a heuristic score onto a persisted status.
     #[must_use]
     pub const fn from_score(score: i32) -> Self {

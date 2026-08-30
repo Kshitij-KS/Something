@@ -1,12 +1,15 @@
 import { access, readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 
-const manifestPath = resolve(process.argv[2] ?? "extension/manifest.json");
+const sourceManifestPath = resolve("extension/manifest.json");
+const builtManifestPath = resolve("extension/dist/manifest.json");
+const manifestPath = resolve(process.argv[2] ?? sourceManifestPath);
 const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
 const failures = [];
 
-if (manifest.manifest_version !== 3)
+if (manifest.manifest_version !== 3) {
   failures.push("manifest_version must be 3");
+}
 if (!/^\d+(?:\.\d+){0,3}$/.test(manifest.version ?? "")) {
   failures.push("version must be a Chrome-compatible numeric version");
 }
@@ -17,18 +20,15 @@ if (typeof manifest.key !== "string" || manifest.key.length === 0) {
 const expectedPermissions = ["nativeMessaging", "storage"];
 if (
   JSON.stringify([...(manifest.permissions ?? [])].sort()) !==
-  JSON.stringify(expectedPermissions.sort())
+  JSON.stringify([...expectedPermissions].sort())
 ) {
   failures.push("permissions must remain nativeMessaging and storage only");
-}
-if (manifest.permissions?.includes("storage.sync")) {
-  failures.push("storage.sync is forbidden by the local-only contract");
 }
 
 const expectedHosts = ["https://app.slack.com/*", "https://mail.google.com/*"];
 if (
   JSON.stringify([...(manifest.host_permissions ?? [])].sort()) !==
-  JSON.stringify(expectedHosts)
+  JSON.stringify([...expectedHosts].sort())
 ) {
   failures.push("host permissions must remain Gmail web and Slack web only");
 }
@@ -37,15 +37,28 @@ const referencedScripts = [
   manifest.background?.service_worker,
   ...(manifest.content_scripts ?? []).flatMap((entry) => entry.js ?? []),
 ].filter(Boolean);
+if (referencedScripts.length === 0) {
+  failures.push("manifest must reference extension scripts");
+}
 
-if (manifestPath.includes(`${resolve("extension/dist")}`)) {
-  const manifestDirectory = resolve(manifestPath, "..");
+if (manifestPath === builtManifestPath) {
+  const sourceManifest = JSON.parse(await readFile(sourceManifestPath, "utf8"));
+  if (JSON.stringify(manifest) !== JSON.stringify(sourceManifest)) {
+    failures.push("built manifest must exactly match extension/manifest.json");
+  }
+  const manifestDirectory = dirname(manifestPath);
+  const requiredFiles = [...referencedScripts, "selectors.json"];
   await Promise.all(
-    referencedScripts.map(async (script) => {
+    requiredFiles.map(async (script) => {
+      const scriptPath = resolve(manifestDirectory, script);
+      if (!scriptPath.startsWith(`${manifestDirectory}${sep}`)) {
+        failures.push(`built manifest contains unsafe path ${script}`);
+        return;
+      }
       try {
-        await access(resolve(manifestDirectory, script));
+        await access(scriptPath);
       } catch {
-        failures.push(`built manifest references missing ${script}`);
+        failures.push(`built extension is missing ${script}`);
       }
     }),
   );
@@ -55,4 +68,4 @@ if (failures.length > 0) {
   throw new Error(failures.join("\n"));
 }
 
-console.log(`Validated ${manifestPath}`);
+console.log(`Validated ${relative(process.cwd(), manifestPath)}`);

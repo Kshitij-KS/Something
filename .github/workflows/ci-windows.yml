@@ -18,50 +18,43 @@ jobs:
           node-version: "20"
           cache: npm
       - run: npm ci
+      - run: npm run stage:native-host
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked -j 1
       - run: cargo build --locked --release -p callback-app -p callback-native-host
       - run: npm run typecheck
       - run: npm run lint
       - run: npm run format:check
-      - run: npm run test
+      - run: npm run test -- --run
       - run: npm run validate:extension
       - run: npm run build
-      - name: Runtime listener audit
-        run: |
-          if Select-String -Path src-tauri/src,crates -Pattern 'TcpListener|UdpSocket' -SimpleMatch {
-            throw 'Callback source must not bind TCP/UDP listeners'
-          }
-      - name: Install NSIS (MSI uses WiX if present)
+      - name: Validate built extension
+        run: npm run validate:extension -- extension/dist/manifest.json
+      - name: Validate extension identity and release versions
+        env:
+          CALLBACK_EXTENSION_ID: ${{ vars.CALLBACK_EXTENSION_ID }}
+        run: npm run verify:release-metadata
+      - name: Static local-only audit
+        run: npm run audit:local-only
+      - name: Install NSIS
         run: choco install nsis --yes --no-progress
-      - name: Bundle unsigned Windows installers
+      - name: Bundle unsigned NSIS and MSI installers
         # No code signing is configured. SmartScreen will warn on these artifacts.
-        # `tauri build` emits NSIS/MSI from tauri.conf.json bundle.targets when the
-        # toolchain is present. The step fails the job if bundling itself errors;
-        # missing signed binaries is expected, not a silent success.
-        run: npx tauri build --bundles nsis,msi
+        # The package verifier fails unless each installer format exists separately.
+        run: npx --no-install tauri build --bundles nsis,msi
+      - name: Package extension and verify artifacts
+        run: npm run package:windows
       - name: Upload unsigned Windows artifacts
         uses: actions/upload-artifact@v4
         with:
           name: callback-windows-unsigned
-          if-no-files-found: warn
-          path: |
-            src-tauri/target/release/bundle/nsis/**
-            src-tauri/target/release/bundle/msi/**
-            src-tauri/target/release/callback.exe
-            src-tauri/target/release/callback-native-host.exe
-            target/release/callback.exe
-            target/release/callback-native-host.exe
+          if-no-files-found: error
+          path: artifacts/*
       - name: Unsigned-binary disclosure
+        shell: pwsh
         run: |
-          Write-Host 'CI does not code-sign. NSIS/MSI (if produced) and the raw EXEs are unsigned.'
+          Write-Host 'CI does not code-sign. NSIS/MSI installers and the extension ZIP are unsigned.'
+          Write-Host 'SHA256SUMS.txt verifies downloaded bytes; it is not a publisher signature.'
           Write-Host 'Windows SmartScreen / Mark-of-the-Web will warn until a certificate is added.'
-          Write-Host 'Package managers do not remove that warning. Do not treat these artifacts as signed releases.'
-          $nsis = Get-ChildItem -Recurse -ErrorAction SilentlyContinue src-tauri/target/release/bundle/nsis, target/release/bundle/nsis
-          $msi = Get-ChildItem -Recurse -ErrorAction SilentlyContinue src-tauri/target/release/bundle/msi, target/release/bundle/msi
-          if (-not $nsis -and -not $msi) {
-            Write-Host 'No NSIS/MSI files were found. cargo release EXEs were still built; installer bundling did not emit packages.'
-          } else {
-            Write-Host "NSIS count=$($nsis.Count) MSI count=$($msi.Count)"
-          }
+          Write-Host 'No package-manager or Chrome Web Store publication is implied.'

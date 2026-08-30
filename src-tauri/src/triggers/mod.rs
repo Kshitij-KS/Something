@@ -54,18 +54,26 @@ pub struct LinkInput<'a> {
 #[must_use]
 pub fn auto_link(input: LinkInput<'_>) -> Vec<Trigger> {
     let mut triggers = Vec::new();
-    if let Some(ctx) = input.source_ctx.filter(|value| !value.is_empty()) {
+    if input.source_app.eq_ignore_ascii_case("manual") {
         triggers.push(Trigger {
-            kind: TriggerKind::AppCtxFocus,
-            match_value: format!("{}:{ctx}", input.source_app),
-            priority: 100,
+            kind: TriggerKind::Manual,
+            match_value: "manual".to_owned(),
+            priority: 0,
+        });
+    } else {
+        if let Some(ctx) = input.source_ctx.filter(|value| !value.is_empty()) {
+            triggers.push(Trigger {
+                kind: TriggerKind::AppCtxFocus,
+                match_value: format!("{}:{ctx}", input.source_app),
+                priority: 100,
+            });
+        }
+        triggers.push(Trigger {
+            kind: TriggerKind::AppFocus,
+            match_value: input.source_app.to_owned(),
+            priority: 10,
         });
     }
-    triggers.push(Trigger {
-        kind: TriggerKind::AppFocus,
-        match_value: input.source_app.to_owned(),
-        priority: 10,
-    });
     let lower = input.text.to_ascii_lowercase();
     for (keyword, exe) in input.keyword_app_map {
         if lower.contains(keyword) {

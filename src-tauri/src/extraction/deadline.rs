@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, NaiveTime, TimeZone, Utc};
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -51,7 +51,8 @@ impl Default for DeadlineLexicon {
     }
 }
 
-/// Parses a temporal anchor against `now` in `offset_seconds`.
+/// Parses a temporal anchor against `now` in an IANA timezone when possible.
+/// The fixed offset is retained as a compatibility fallback for older callers.
 #[must_use]
 pub fn parse_deadline(
     clause: &str,
@@ -60,28 +61,59 @@ pub fn parse_deadline(
     tz_label: &str,
     lexicon: &DeadlineLexicon,
 ) -> Option<ParsedDeadline> {
+    if let Ok(timezone) = tz_label.parse::<chrono_tz::Tz>() {
+        return parse_in_zone(clause, now_utc, timezone, tz_label, lexicon);
+    }
     let offset = FixedOffset::east_opt(offset_seconds)?;
-    let now_local = now_utc.with_timezone(&offset);
+    parse_in_zone(clause, now_utc, offset, tz_label, lexicon)
+}
+
+fn parse_in_zone<Tz>(
+    clause: &str,
+    now_utc: DateTime<Utc>,
+    timezone: Tz,
+    tz_label: &str,
+    lexicon: &DeadlineLexicon,
+) -> Option<ParsedDeadline>
+where
+    Tz: TimeZone + Copy,
+{
+    let now_local = now_utc.with_timezone(&timezone);
     let lower = clause.to_ascii_lowercase();
-    let (local, precision) = if lower.contains("in an hour") {
-        (now_local + Duration::hours(1), DeadlinePrecision::Minute)
+    let (utc_ts, precision) = if lower.contains("in an hour") {
+        (
+            (now_local + Duration::hours(1))
+                .with_timezone(&Utc)
+                .timestamp(),
+            DeadlinePrecision::Minute,
+        )
     } else if lower.contains("tomorrow") {
         (
-            at_eod(now_local.date_naive() + Duration::days(1), lexicon, offset)?,
+            at_eod(
+                now_local.date_naive() + Duration::days(1),
+                lexicon,
+                timezone,
+            )?
+            .with_timezone(&Utc)
+            .timestamp(),
             DeadlinePrecision::Eod,
         )
     } else if lower.contains("tonight") {
         (
-            now_local
-                .date_naive()
-                .and_time(NaiveTime::from_hms_opt(21, 0, 0)?)
-                .and_local_timezone(offset)
-                .single()?,
+            local_datetime(
+                now_local.date_naive(),
+                NaiveTime::from_hms_opt(21, 0, 0)?,
+                timezone,
+            )?
+            .with_timezone(&Utc)
+            .timestamp(),
             DeadlinePrecision::Hour,
         )
     } else if lower.contains("eod") || lower.contains("end of day") || has_word(&lower, "today") {
         (
-            at_eod(now_local.date_naive(), lexicon, offset)?,
+            at_eod(now_local.date_naive(), lexicon, timezone)?
+                .with_timezone(&Utc)
+                .timestamp(),
             DeadlinePrecision::Eod,
         )
     } else if lower.contains("eow")
@@ -90,24 +122,34 @@ pub fn parse_deadline(
         || lower.contains("by friday")
     {
         (
-            at_eow(now_local.date_naive(), lexicon, offset)?,
+            at_eow(now_local.date_naive(), lexicon, timezone)?
+                .with_timezone(&Utc)
+                .timestamp(),
             DeadlinePrecision::Eow,
         )
     } else if lower.contains("next week") {
         (
-            at_eow(now_local.date_naive() + Duration::weeks(1), lexicon, offset)?,
+            at_eow(
+                now_local.date_naive() + Duration::weeks(1),
+                lexicon,
+                timezone,
+            )?
+            .with_timezone(&Utc)
+            .timestamp(),
             DeadlinePrecision::Eow,
         )
     } else if let Some(day) = parse_ordinal_day(&lower) {
         (
-            next_ordinal(now_local.date_naive(), day, lexicon, offset)?,
+            next_ordinal(now_local.date_naive(), day, lexicon, timezone)?
+                .with_timezone(&Utc)
+                .timestamp(),
             DeadlinePrecision::Day,
         )
     } else {
         return None;
     };
     Some(ParsedDeadline {
-        utc_ts: local.with_timezone(&Utc).timestamp(),
+        utc_ts,
         tz_label: tz_label.to_owned(),
         precision,
     })
@@ -119,24 +161,30 @@ fn has_word(haystack: &str, word: &str) -> bool {
         .any(|token| token == word)
 }
 
-fn at_eod(
+fn local_datetime<Tz: TimeZone>(
     date: NaiveDate,
-    lexicon: &DeadlineLexicon,
-    offset: FixedOffset,
-) -> Option<DateTime<FixedOffset>> {
-    date.and_time(lexicon.eod)
-        .and_local_timezone(offset)
-        .single()
+    time: NaiveTime,
+    timezone: Tz,
+) -> Option<DateTime<Tz>> {
+    date.and_time(time).and_local_timezone(timezone).single()
 }
 
-fn at_eow(
+fn at_eod<Tz: TimeZone>(
     date: NaiveDate,
     lexicon: &DeadlineLexicon,
-    offset: FixedOffset,
-) -> Option<DateTime<FixedOffset>> {
+    timezone: Tz,
+) -> Option<DateTime<Tz>> {
+    local_datetime(date, lexicon.eod, timezone)
+}
+
+fn at_eow<Tz: TimeZone + Copy>(
+    date: NaiveDate,
+    lexicon: &DeadlineLexicon,
+    timezone: Tz,
+) -> Option<DateTime<Tz>> {
     let current = date.weekday().num_days_from_monday();
     let delta = (i64::from(lexicon.eow_weekday) + 7 - i64::from(current)) % 7;
-    at_eod(date + Duration::days(delta), lexicon, offset)
+    at_eod(date + Duration::days(delta), lexicon, timezone)
 }
 
 fn ordinal_re() -> &'static Regex {
@@ -149,18 +197,18 @@ fn parse_ordinal_day(lower: &str) -> Option<u32> {
     caps.get(1)?.as_str().parse().ok()
 }
 
-fn next_ordinal(
+fn next_ordinal<Tz: TimeZone + Copy>(
     today: NaiveDate,
     day: u32,
     lexicon: &DeadlineLexicon,
-    offset: FixedOffset,
-) -> Option<DateTime<FixedOffset>> {
+    timezone: Tz,
+) -> Option<DateTime<Tz>> {
     let mut year = today.year();
     let mut month = today.month();
     for _ in 0..3 {
         if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
             if date >= today {
-                return at_eod(date, lexicon, offset);
+                return at_eod(date, lexicon, timezone);
             }
         }
         month += 1;

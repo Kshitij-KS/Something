@@ -2,7 +2,7 @@
 
 use callback_protocol::{
     Envelope, HOST_TO_CHROME_MAX, MessageKind, PROTOCOL_VERSION, decode_envelope, encode_envelope,
-    read_frame, write_frame,
+    read_frame_or_eof, write_frame,
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -21,7 +21,7 @@ pub enum IpcError {
     Protocol(#[from] callback_protocol::ProtocolError),
 }
 
-/// Handles a single host connection: decode, persist via callback, ack.
+/// Handles one host connection until the client disconnects cleanly.
 ///
 /// # Errors
 ///
@@ -36,16 +36,18 @@ where
     W: Write,
     F: FnMut(Envelope) -> Result<Envelope, String>,
 {
-    let bytes = read_frame(reader, callback_protocol::CHROME_TO_HOST_MAX)?;
-    let envelope = decode_envelope(&bytes)?;
-    let ack = commit(envelope).unwrap_or_else(|error| Envelope {
-        protocol_version: PROTOCOL_VERSION,
-        kind: MessageKind::Error,
-        id: "ipc".into(),
-        payload: serde_json::json!({ "error": error }),
-    });
-    let encoded = encode_envelope(&ack)?;
-    write_frame(writer, &encoded, HOST_TO_CHROME_MAX)?;
+    while let Some(bytes) = read_frame_or_eof(reader, callback_protocol::CHROME_TO_HOST_MAX)? {
+        let envelope = decode_envelope(&bytes)?;
+        let envelope_id = envelope.id.clone();
+        let ack = commit(envelope).unwrap_or_else(|error| Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            kind: MessageKind::Error,
+            id: envelope_id,
+            payload: serde_json::json!({ "error": error }),
+        });
+        let encoded = encode_envelope(&ack)?;
+        write_frame(writer, &encoded, HOST_TO_CHROME_MAX)?;
+    }
     Ok(())
 }
 
@@ -76,15 +78,18 @@ mod windows_impl {
     use super::{CommitFn, IpcError, PIPE_PATH, serve_connection};
     use std::fs::File;
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::sync::Arc;
     use std::thread;
-    use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Foundation::{HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows::core::PCWSTR;
+
+    const ERROR_PIPE_CONNECTED_HRESULT: i32 = -2_147_024_361;
 
     pub fn spawn(commit: CommitFn) -> Result<(), IpcError> {
         thread::Builder::new()
@@ -107,18 +112,34 @@ mod windows_impl {
     fn accept_one(commit: &CommitFn) -> Result<(), IpcError> {
         let handle = create_pipe()?;
         // SAFETY: `handle` is a dedicated pipe instance for this accept.
-        let connected = unsafe { ConnectNamedPipe(handle, None) };
-        if connected.is_err() {
-            drop_handle(handle);
-            return Err(IpcError::Io("ConnectNamedPipe failed".into()));
+        if let Err(error) = unsafe { ConnectNamedPipe(handle, None) } {
+            if error.code().0 != ERROR_PIPE_CONNECTED_HRESULT {
+                drop_handle(handle);
+                return Err(IpcError::Io(format!("ConnectNamedPipe failed: {error}")));
+            }
         }
         // SAFETY: `handle` is an exclusive pipe HANDLE; File takes ownership.
-        let mut file = unsafe { File::from_raw_handle(handle.0 as RawHandle) };
-        let mut writer = file
-            .try_clone()
+        let file = unsafe { File::from_raw_handle(handle.0 as RawHandle) };
+        let callback = Arc::clone(commit);
+        thread::Builder::new()
+            .name("callback-pipe-client".into())
+            .spawn(move || {
+                let mut reader = file;
+                let writer = reader.try_clone();
+                match writer {
+                    Ok(mut writer) => {
+                        if let Err(error) = serve_connection(&mut reader, &mut writer, |envelope| {
+                            callback(envelope)
+                        }) {
+                            tracing::debug!(error = %error, "pipe client disconnected");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "pipe handle clone failed");
+                    }
+                }
+            })
             .map_err(|error| IpcError::Io(error.to_string()))?;
-        serve_connection(&mut file, &mut writer, |envelope| commit(envelope))?;
-        let _ = OwnedHandle::from(file);
         Ok(())
     }
 
@@ -127,13 +148,14 @@ mod windows_impl {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
+        let descriptor = owner_only_descriptor()?;
         let mut security = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>())
                 .map_err(|error| IpcError::Io(error.to_string()))?,
-            lpSecurityDescriptor: owner_only_descriptor(),
+            lpSecurityDescriptor: descriptor.as_ptr(),
             bInheritHandle: false.into(),
         };
-        // SAFETY: null-terminated pipe name and owner-only security descriptor.
+        // SAFETY: null-terminated pipe name and validated owner-only descriptor.
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
@@ -152,28 +174,47 @@ mod windows_impl {
         Ok(handle)
     }
 
-    fn owner_only_descriptor() -> *mut core::ffi::c_void {
+    struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl OwnedSecurityDescriptor {
+        fn as_ptr(&self) -> *mut core::ffi::c_void {
+            self.0.0
+        }
+    }
+
+    impl Drop for OwnedSecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: the descriptor was allocated by LocalAlloc through the SDDL converter.
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.0)));
+            }
+        }
+    }
+
+    fn owner_only_descriptor() -> Result<OwnedSecurityDescriptor, IpcError> {
         use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-        use windows::Win32::Security::PSECURITY_DESCRIPTOR;
-        let mut sd = PSECURITY_DESCRIPTOR::default();
+
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
         let sddl: Vec<u16> = "D:P(A;;GA;;;OW)"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        // SAFETY: SDDL is a valid UTF-16 owner-only descriptor.
-        let ok = unsafe {
+        // SAFETY: SDDL is a valid null-terminated UTF-16 owner-only descriptor.
+        unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 PCWSTR(sddl.as_ptr()),
                 1,
-                std::ptr::from_mut(&mut sd),
+                std::ptr::from_mut(&mut descriptor),
                 None,
             )
-        };
-        if ok.is_ok() {
-            sd.0
-        } else {
-            std::ptr::null_mut()
         }
+        .map_err(|error| IpcError::Io(format!("owner-only ACL creation failed: {error}")))?;
+        if descriptor.0.is_null() {
+            return Err(IpcError::Io(
+                "owner-only ACL creation returned a null descriptor".into(),
+            ));
+        }
+        Ok(OwnedSecurityDescriptor(descriptor))
     }
 
     fn drop_handle(handle: HANDLE) {

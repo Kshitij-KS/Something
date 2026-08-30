@@ -11,6 +11,7 @@ export type SendIntent = {
   rawMessage: string;
   via: "click" | "keyboard";
   composing: boolean;
+  composerId?: string;
 };
 
 export type CaptureDecision =
@@ -19,6 +20,7 @@ export type CaptureDecision =
   | { type: "confirm"; key: string };
 
 const recent = new Map<string, number>();
+const pendingDedupe = new Map<string, string>();
 
 export function shouldCapture(event: SendIntent): CaptureDecision {
   if (event.composing) {
@@ -27,23 +29,23 @@ export function shouldCapture(event: SendIntent): CaptureDecision {
   if (!event.rawMessage.trim()) {
     return { type: "ignore", reason: "empty" };
   }
-  if (
-    event.rawMessage.split("\n").some((line) => line.trim().startsWith(">"))
-  ) {
-    return { type: "ignore", reason: "quoted" };
-  }
-  const key = `${event.sourceApp}:${event.sourceCtx ?? ""}:${event.rawMessage}`;
-  const last = recent.get(key);
+  const dedupeKey = `${event.sourceApp}:${event.composerId ?? "unknown"}:${event.sourceCtx ?? ""}:${event.rawMessage}`;
+  const last = recent.get(dedupeKey);
   const now = Date.now();
   if (last && now - last < 2000) {
     return { type: "ignore", reason: "duplicate" };
   }
-  recent.set(key, now);
+  recent.set(dedupeKey, now);
+  const key = `${now.toString(36)}-${globalThis.crypto.randomUUID()}`;
+  pendingDedupe.set(key, dedupeKey);
   return { type: "intent", key, intent: event };
 }
 
 export function confirmSend(key: string, succeeded: boolean): CaptureDecision {
+  const dedupeKey = pendingDedupe.get(key);
+  pendingDedupe.delete(key);
   if (!succeeded) {
+    if (dedupeKey) recent.delete(dedupeKey);
     return { type: "ignore", reason: "failed_send" };
   }
   return { type: "confirm", key };

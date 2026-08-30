@@ -1,4 +1,8 @@
+use crate::db::{Database, DbError};
 use crate::domain::{PromiseEvent, PromiseStatus, apply_promise};
+
+pub const ACTION_SCHEME: &str = "callback-action";
+pub const DEFAULT_SNOOZE_SECONDS: i64 = 60 * 60;
 
 /// Notification / review action presented with an action token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,6 +11,50 @@ pub enum SurfaceAction {
     Snooze,
     Reject,
     Ignore,
+}
+
+impl SurfaceAction {
+    #[must_use]
+    pub const fn verb(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Snooze => "snooze",
+            Self::Reject => "reject",
+            Self::Ignore => "ignore",
+        }
+    }
+
+    #[must_use]
+    pub const fn db_value(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Snooze => "snooze",
+            Self::Reject => "not_a_promise",
+            Self::Ignore => "ignored",
+        }
+    }
+
+    #[must_use]
+    pub const fn event(self, ignore_count: u32) -> PromiseEvent {
+        match self {
+            Self::Done => PromiseEvent::Complete,
+            Self::Snooze => PromiseEvent::Snooze,
+            Self::Reject => PromiseEvent::Reject,
+            Self::Ignore => PromiseEvent::Ignore {
+                count_after: ignore_count.saturating_add(1),
+            },
+        }
+    }
+
+    fn from_verb(value: &str) -> Option<Self> {
+        match value {
+            "done" => Some(Self::Done),
+            "snooze" => Some(Self::Snooze),
+            "reject" => Some(Self::Reject),
+            "ignore" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of redeeming an action token.
@@ -21,7 +69,89 @@ pub enum ActionResult {
     UnknownToken,
 }
 
-/// Crash-safe action callback: a token may be redeemed once.
+/// Parsed local protocol activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionActivation {
+    pub action: SurfaceAction,
+    pub action_token: String,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum ParseActionError {
+    #[error("malformed Callback action URI")]
+    Malformed,
+    #[error("unknown Callback action")]
+    UnknownAction,
+    #[error("Callback action token is not a canonical UUID")]
+    InvalidToken,
+    #[error("multiple Callback actions were supplied")]
+    Ambiguous,
+}
+
+/// Parses one argument without touching process or application state.
+pub fn parse_action_argument(raw: &str) -> Result<Option<ActionActivation>, ParseActionError> {
+    let Some(rest) = raw.strip_prefix("callback-action://") else {
+        if raw.starts_with("callback-action:") {
+            return Err(ParseActionError::Malformed);
+        }
+        return Ok(None);
+    };
+    let mut parts = rest.split('/');
+    let verb = parts.next().filter(|part| !part.is_empty());
+    let token = parts.next().filter(|part| !part.is_empty());
+    if verb.is_none() || token.is_none() || parts.next().is_some() {
+        return Err(ParseActionError::Malformed);
+    }
+    let action = SurfaceAction::from_verb(verb.unwrap_or_default())
+        .ok_or(ParseActionError::UnknownAction)?;
+    let token = token.unwrap_or_default();
+    let parsed = uuid::Uuid::parse_str(token).map_err(|_| ParseActionError::InvalidToken)?;
+    if parsed.to_string() != token {
+        return Err(ParseActionError::InvalidToken);
+    }
+    Ok(Some(ActionActivation {
+        action,
+        action_token: token.to_owned(),
+    }))
+}
+
+/// Finds at most one Callback action in cold-start process arguments.
+pub fn parse_cold_start_args<I, S>(args: I) -> Result<Option<ActionActivation>, ParseActionError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut activation = None;
+    for arg in args {
+        if let Some(parsed) = parse_action_argument(arg.as_ref())? {
+            if activation.is_some() {
+                return Err(ParseActionError::Ambiguous);
+            }
+            activation = Some(parsed);
+        }
+    }
+    Ok(activation)
+}
+
+/// Redeems a parsed activation with a deterministic one-hour snooze policy.
+pub fn dispatch_activation(
+    db: &Database,
+    activation: &ActionActivation,
+    now: i64,
+    local_day: &str,
+) -> Result<ActionResult, DbError> {
+    let snooze_until = matches!(activation.action, SurfaceAction::Snooze)
+        .then_some(now.saturating_add(DEFAULT_SNOOZE_SECONDS));
+    db.redeem_surface_action(
+        &activation.action_token,
+        activation.action,
+        now,
+        local_day,
+        snooze_until,
+    )
+}
+
+/// In-memory transition helper retained for pure state-machine tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionToken {
     pub token: String,
@@ -30,7 +160,8 @@ pub struct ActionToken {
     pub ignore_count: u32,
 }
 
-/// Redeems a stored token. Duplicate and late callbacks are no-ops.
+/// Redeems an in-memory token. Durable production callbacks use
+/// [`dispatch_activation`] instead.
 #[must_use]
 pub fn redeem(token: &mut ActionToken, presented: &str, action: SurfaceAction) -> ActionResult {
     if token.token != presented {
@@ -39,14 +170,7 @@ pub fn redeem(token: &mut ActionToken, presented: &str, action: SurfaceAction) -
     if token.consumed {
         return ActionResult::Duplicate;
     }
-    let event = match action {
-        SurfaceAction::Done => PromiseEvent::Complete,
-        SurfaceAction::Snooze => PromiseEvent::Snooze,
-        SurfaceAction::Reject => PromiseEvent::Reject,
-        SurfaceAction::Ignore => PromiseEvent::Ignore {
-            count_after: token.ignore_count.saturating_add(1),
-        },
-    };
+    let event = action.event(token.ignore_count);
     match apply_promise(token.promise_status, event) {
         Ok(next) => {
             token.consumed = true;

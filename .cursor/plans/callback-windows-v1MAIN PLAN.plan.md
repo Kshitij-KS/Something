@@ -10,16 +10,16 @@ todos:
     status: completed
   - id: phase0-proof
     content: Build and validate the Windows focus-to-notification Phase 0 kill gate
-    status: completed
+    status: in_progress
   - id: capture-pipeline
     content: Implement native messaging, durable extension capture, extraction, and review
-    status: completed
+    status: in_progress
   - id: close-loop
     content: Implement context matching, surfacing policy, actions, and acceptance gate
-    status: completed
+    status: in_progress
   - id: launch-hardening
     content: Finish onboarding, diagnostics, privacy checks, CI, and Windows packaging
-    status: completed
+    status: in_progress
 isProject: false
 ---
 
@@ -31,7 +31,7 @@ isProject: false
 - Deliver Windows first. Keep platform boundaries for future macOS and Linux implementations.
 - Implement Phase 0, Phase 1, and Phase 2 sequentially. Do not begin the next phase until its kill gate passes.
 - Exclude mobile, accounts, cloud sync, servers, calendar/email sending, team task management, local LLM extraction, and non-Chrome browsers from v1.
-- Define “local-only” precisely: Callback runtime opens no TCP/UDP listener and transmits no message content. Chrome Store/package-manager traffic is outside the runtime guarantee.
+- Define “local-only” precisely: Callback runtime opens no TCP/UDP listener and sends no captured message content over TCP/UDP or to a remote service. Chrome Store/package-manager traffic is outside the runtime guarantee.
 
 ## Corrections to the source spec
 
@@ -61,8 +61,6 @@ flowchart TB
   Trigger --> Toast["Windows notification adapter"]
   Trigger --> Ui["Review, settings, and quick-capture UI"]
 ```
-
-
 
 - Keep one long-lived Tauri process and one logical SQLite writer. The native host authenticates the extension origin, validates a versioned protocol, and forwards envelopes over a per-user named pipe.
 - Persist an extension outbox in `chrome.storage.local`. Remove an item only after the core commits it and returns an acknowledgement.
@@ -148,7 +146,7 @@ flowchart TB
 - All unit tests, integration tests, lints, type checks, and the Windows installed-build matrix pass.
 - The native protocol is versioned, bounded, origin-checked, retry-safe, and produces no stdout outside framed messages.
 - Capture, surface, snooze, completion, rejection, and restart flows are durable and idempotent.
-- Callback opens no network listener and does not transmit captured content.
+- Callback opens no network listener and sends no captured content over TCP/UDP or to a remote service.
 - Phase 0, extraction precision, and two-week acceptance kill gates pass with recorded local results.
 - Windows onboarding, reconnect, diagnostics, purge, and unsigned-binary disclosures are complete.
 - macOS/Linux remain compile-safe extension points, not claimed v1 functionality.
@@ -160,4 +158,3 @@ flowchart TB
 - [Windows SetWinEventHook](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook)
 - [Tauri notifications](https://v2.tauri.app/plugin/notification/)
 - [SQLite foreign keys](https://sqlite.org/foreignkeys.html)
-

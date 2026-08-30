@@ -8,12 +8,17 @@
     "build": "npm run typecheck && npm run build:app && npm run build:extension",
     "build:app": "vite build",
     "build:extension": "vite build --config extension/vite.config.ts",
+    "stage:native-host": "cargo build --locked --release --package callback-native-host && node scripts/stage-native-host.mjs",
     "typecheck": "tsc --noEmit && tsc --project extension/tsconfig.json --noEmit",
     "lint": "eslint . --max-warnings 0",
     "test": "vitest run",
+    "evaluate:private-corpus": "cargo test --locked -p callback-app --test private_corpus -- --ignored --nocapture",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "validate:extension": "node scripts/validate-extension.mjs",
+    "verify:release-metadata": "node scripts/verify-release-metadata.mjs",
+    "audit:local-only": "node scripts/audit-local-only.mjs",
+    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1",
     "tauri": "tauri"
   },
   "dependencies": {

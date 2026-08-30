@@ -1,10 +1,11 @@
-use crate::db::Database;
-use crate::domain::{PromiseStatus, SourceApp};
+use crate::db::{Database, validate_setting};
+use crate::domain::PromiseStatus;
 use crate::health::{HealthSnapshot, selector_banner, silence_remaining};
 use crate::native_host::autostart::apply_autostart;
 use crate::native_host::install::{install_host, reconnect};
 use crate::platform::active_adapter;
-use crate::review::{ReviewAction, ReviewItem, apply_review};
+use crate::platform::focus::LiveBrowserContext;
+use crate::review::{ReviewAction, ReviewItem, apply_review, ingest_manual};
 use crate::shortcut::{ShortcutOutcome, ShortcutPlan, open_quick_window, register_on_app};
 use crate::surfacing::phase0::Phase0Rule;
 use serde::Serialize;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub app_exe: PathBuf,
     pub last_handshake_at: Arc<Mutex<Option<i64>>>,
     pub shortcut_status: Arc<Mutex<ShortcutOutcome>>,
+    pub live_browser: Arc<Mutex<Option<LiveBrowserContext>>>,
+    pub browser_transition_tx: std::sync::mpsc::SyncSender<()>,
 }
 
 #[derive(Serialize)]
@@ -27,6 +30,17 @@ pub struct KillGateDto {
     pub id: String,
     pub status: String,
     pub notes: String,
+}
+
+#[derive(Serialize)]
+pub struct QuickCaptureResult {
+    pub capture_id: String,
+    pub promise_id: i64,
+}
+
+#[derive(Serialize)]
+pub struct PurgeSchedule {
+    pub scheduled: bool,
 }
 
 /// Lists review-status promises.
@@ -95,21 +109,21 @@ pub fn add_phase0(
 
 /// Quick-capture from the shortcut window. Does not read selected text.
 #[tauri::command]
-pub fn quick_capture(state: State<'_, AppState>, text: String) -> Result<usize, String> {
+pub fn quick_capture(
+    state: State<'_, AppState>,
+    capture_id: String,
+    text: String,
+) -> Result<QuickCaptureResult, String> {
+    if !capture_id.starts_with("manual-") || capture_id.len() > 128 {
+        return Err("quick-capture id is invalid".into());
+    }
     let db = state.db.lock().map_err(|_| "db poisoned")?;
-    crate::review::ingest_message(
-        &db,
-        &format!("manual-{}", uuid::Uuid::new_v4()),
-        SourceApp::Manual,
-        None,
-        None,
-        &text,
-        now_unix(),
-        chrono::Utc::now(),
-        0,
-        "UTC",
-    )
-    .map_err(|error| error.to_string())
+    let promise_id =
+        ingest_manual(&db, &capture_id, &text, now_unix()).map_err(|error| error.to_string())?;
+    Ok(QuickCaptureResult {
+        capture_id,
+        promise_id,
+    })
 }
 
 /// Settings upsert with validation.
@@ -120,13 +134,42 @@ pub fn save_setting(
     key: String,
     value: String,
 ) -> Result<(), String> {
+    validate_setting(&key, &value).map_err(|error| error.to_string())?;
     if key == "autostart_enabled" {
-        apply_autostart(&state.app_exe, value == "true").map_err(|error| error.to_string())?;
+        let applied =
+            apply_autostart(&state.app_exe, value == "true").map_err(|error| error.to_string())?;
+        if !applied {
+            return Err("autostart is not supported on this platform".into());
+        }
     }
     {
         let db = state.db.lock().map_err(|_| "db poisoned")?;
         db.upsert_setting(&key, &value)
             .map_err(|error| error.to_string())?;
+        if key == "retention_days" {
+            db.enforce_retention(now_unix())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if value == "false" {
+        let disabled_site = match key.as_str() {
+            "gmail_enabled" => Some("gmail"),
+            "slack_enabled" => Some("slack"),
+            _ => None,
+        };
+        if let Some(site) = disabled_site {
+            let mut live = state
+                .live_browser
+                .lock()
+                .map_err(|_| "browser context poisoned")?;
+            if live
+                .as_ref()
+                .is_some_and(|entry| entry.context.source_app == site)
+            {
+                *live = None;
+                let _ = state.browser_transition_tx.try_send(());
+            }
+        }
     }
     if key == "global_shortcut" || key == "global_shortcut_fallback" {
         reregister_shortcut(&app, &state)?;
@@ -153,6 +196,49 @@ pub fn health(state: State<'_, AppState>) -> Result<HealthSnapshot, String> {
         .get_setting("slack_enabled")
         .map_err(|error| error.to_string())?
         .unwrap_or_else(|| "true".into());
+    let now = chrono::Utc::now();
+    let selector_records = db.selector_health().map_err(|error| error.to_string())?;
+    let selectors = selector_records
+        .into_iter()
+        .map(|record| {
+            let enabled = match record.site.as_str() {
+                "gmail" => gmail != "false",
+                "slack" => slack != "false",
+                _ => false,
+            };
+            let days = crate::health::days_without_capture(
+                now.timestamp(),
+                record.first_observed_at,
+                record.last_capture_at,
+            );
+            let status = if enabled {
+                record.state
+            } else {
+                "disabled".into()
+            };
+            let banner = enabled
+                .then(|| selector_banner(&record.site, &status, days))
+                .flatten();
+            crate::health::SelectorHealthSnapshot {
+                site: record.site,
+                status,
+                first_observed_at: record.first_observed_at,
+                last_probe_at: record.last_probe_at,
+                last_success_at: record.last_success_at,
+                last_capture_at: record.last_capture_at,
+                consecutive_failures: record.consecutive_failures,
+                days_without_capture: days,
+                banner,
+            }
+        })
+        .collect::<Vec<_>>();
+    let site_status = |site: &str| {
+        selectors
+            .iter()
+            .find(|selector| selector.site == site)
+            .map(|selector| selector.status.clone())
+            .unwrap_or_else(|| "unknown".into())
+    };
     let silence_until = db
         .get_setting("onboarding_completed_at")
         .map_err(|error| error.to_string())?;
@@ -173,18 +259,11 @@ pub fn health(state: State<'_, AppState>) -> Result<HealthSnapshot, String> {
         } else {
             "missing".into()
         },
-        gmail: if gmail == "true" {
-            "healthy".into()
-        } else {
-            "disabled".into()
-        },
-        slack: if slack == "true" {
-            "healthy".into()
-        } else {
-            "disabled".into()
-        },
+        gmail: site_status("gmail"),
+        slack: site_status("slack"),
+        selectors,
         last_handshake_at,
-        silence_remaining_secs: silence_remaining(chrono::Utc::now(), silence_until.as_deref()),
+        silence_remaining_secs: silence_remaining(now, silence_until.as_deref()),
         opens_network_listener: active_adapter().opens_network_listener(),
         shortcut: state
             .shortcut_status
@@ -217,10 +296,28 @@ pub fn complete_onboarding(state: State<'_, AppState>) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Lists human-time kill gates that remain pending.
+/// Lists human-time kill gates and their recorded evidence status.
 #[tauri::command]
 pub fn list_kill_gates(state: State<'_, AppState>) -> Result<Vec<KillGateDto>, String> {
     let db = state.db.lock().map_err(|_| "db poisoned")?;
+    kill_gate_dtos(&db)
+}
+
+/// Records a human kill-gate decision, enforcing prerequisite order.
+#[tauri::command]
+pub fn record_kill_gate(
+    state: State<'_, AppState>,
+    id: String,
+    status: String,
+    notes: String,
+) -> Result<Vec<KillGateDto>, String> {
+    let db = state.db.lock().map_err(|_| "db poisoned")?;
+    db.update_kill_gate(&id, &status, &notes)
+        .map_err(|error| error.to_string())?;
+    kill_gate_dtos(&db)
+}
+
+fn kill_gate_dtos(db: &Database) -> Result<Vec<KillGateDto>, String> {
     db.kill_gates()
         .map(|rows| {
             rows.into_iter()
@@ -234,13 +331,28 @@ pub fn list_kill_gates(state: State<'_, AppState>) -> Result<Vec<KillGateDto>, S
         .map_err(|error| error.to_string())
 }
 
-/// Purges local data and unregisters the native host.
+/// Schedules a helper process to purge local data after this process exits.
 #[tauri::command]
-pub fn purge_data(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let db_path = state.db_path.clone();
-    let _ = crate::purge::purge_local_data_path(&db_path);
+pub fn purge_data(app: AppHandle, state: State<'_, AppState>) -> Result<PurgeSchedule, String> {
+    let mut command = std::process::Command::new(&state.app_exe);
+    command
+        .arg("--purge")
+        .arg("--db")
+        .arg(&state.db_path)
+        .arg("--manifest")
+        .arg(state.host_exe.with_extension("json"))
+        .arg("--wait-pid")
+        .arg(std::process::id().to_string());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+        .spawn()
+        .map_err(|error| format!("start purge helper: {error}"))?;
     app.exit(0);
-    Ok(())
+    Ok(PurgeSchedule { scheduled: true })
 }
 
 /// Opens the existing `?window=quick` window. In-app fallback when the hotkey failed.

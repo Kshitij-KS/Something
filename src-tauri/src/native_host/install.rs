@@ -1,4 +1,5 @@
 //! Atomic native-messaging host manifest registration.
+#![cfg_attr(windows, allow(unsafe_code))]
 
 use serde_json::json;
 use std::fs;
@@ -24,8 +25,15 @@ pub struct InstallReport {
 ///
 /// # Errors
 ///
-/// Returns IO errors when the manifest cannot be written.
+/// Returns IO errors when the executable is absent or the manifest cannot be replaced.
 pub fn install_host(host_exe: &Path) -> io::Result<InstallReport> {
+    if !host_exe.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("native host not found at {}", host_exe.display()),
+        ));
+    }
+
     let manifest_path = host_exe.with_extension("json");
     let manifest = json!({
         "name": HOST_NAME,
@@ -36,7 +44,11 @@ pub fn install_host(host_exe: &Path) -> io::Result<InstallReport> {
     });
     let tmp = manifest_path.with_extension("json.tmp");
     fs::write(&tmp, serde_json::to_vec_pretty(&manifest)?)?;
-    fs::rename(&tmp, &manifest_path)?;
+    if let Err(error) = replace_manifest(&tmp, &manifest_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+
     let registered = register(&manifest_path)?;
     Ok(InstallReport {
         manifest_path: manifest_path.display().to_string(),
@@ -56,6 +68,46 @@ pub fn install_host(host_exe: &Path) -> io::Result<InstallReport> {
 /// Returns IO errors when the manifest cannot be rewritten.
 pub fn reconnect(host_exe: &Path) -> io::Result<InstallReport> {
     install_host(host_exe)
+}
+
+#[cfg(windows)]
+fn replace_manifest(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: both paths are valid null-terminated UTF-16 buffers for this call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_manifest(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
 }
 
 fn register(manifest_path: &Path) -> io::Result<bool> {
@@ -91,7 +143,7 @@ fn register(manifest_path: &Path) -> io::Result<bool> {
 #[cfg(windows)]
 fn register_windows(manifest_path: &Path) -> io::Result<bool> {
     use std::os::windows::process::CommandExt;
-    let path = manifest_path.display().to_string().replace('\\', "\\\\");
+
     let status = std::process::Command::new("reg")
         .args([
             "add",
@@ -105,13 +157,18 @@ fn register_windows(manifest_path: &Path) -> io::Result<bool> {
         ])
         .creation_flags(0x0800_0000)
         .status()?;
-    let _ = path;
-    Ok(status.success())
+    if status.success() {
+        Ok(true)
+    } else {
+        Err(io::Error::other(format!(
+            "reg.exe rejected native-host registration with {status}"
+        )))
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn macos_path() -> io::Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|error| io::Error::other(error))?;
+    let home = std::env::var("HOME").map_err(io::Error::other)?;
     Ok(PathBuf::from(home)
         .join("Library/Application Support/Google/Chrome/NativeMessagingHosts")
         .join(format!("{HOST_NAME}.json")))
@@ -119,7 +176,7 @@ fn macos_path() -> io::Result<PathBuf> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn linux_path() -> io::Result<PathBuf> {
-    let home = std::env::var("HOME").map_err(|error| io::Error::other(error))?;
+    let home = std::env::var("HOME").map_err(io::Error::other)?;
     Ok(PathBuf::from(home)
         .join(".config/google-chrome/NativeMessagingHosts")
         .join(format!("{HOST_NAME}.json")))

@@ -1,21 +1,50 @@
 //! Notification delivery behind a testable sink.
+#![cfg_attr(windows, allow(unsafe_code))]
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
+
+pub const CALLBACK_APP_ID: &str = "com.callback.desktop";
+pub const ACTIONABLE_REMINDER_TITLE: &str = "Callback";
+pub const ACTIONABLE_REMINDER_BODY: &str = "A reminder is ready in Callback.";
 
 /// Payload shown on a surface attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationRequest {
     pub title: String,
     pub body: String,
-    pub action_token: String,
+    pub action_token: Option<String>,
 }
 
-/// Delivery failure.
+impl NotificationRequest {
+    /// Builds an actionable request with fixed copy so captured text never
+    /// enters Windows notification or lock-screen history.
+    #[must_use]
+    pub fn actionable(token: &str) -> Self {
+        Self {
+            title: ACTIONABLE_REMINDER_TITLE.into(),
+            body: ACTIONABLE_REMINDER_BODY.into(),
+            action_token: Some(token.to_owned()),
+        }
+    }
+
+    #[must_use]
+    pub fn informational(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            action_token: None,
+        }
+    }
+}
+
+/// Delivery or OS-history failure.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum NotifyError {
     #[error("notification delivery failed: {0}")]
     Delivery(String),
+    #[error("notification history cleanup failed: {0}")]
+    HistoryCleanup(String),
 }
 
 /// OS-backed or test notification sink.
@@ -54,6 +83,55 @@ impl NotificationSink for RecordingSink {
     }
 }
 
+/// Builds a toast payload on every platform so CI can verify action wiring.
+#[must_use]
+pub fn toast_xml(request: &NotificationRequest) -> String {
+    let title = xml_escape(&request.title);
+    let body = xml_escape(&request.body);
+    let actions = request.action_token.as_ref().map_or_else(String::new, |token| {
+        let token = xml_escape(token);
+        format!(
+            "<actions>\
+               <action content=\"Done\" activationType=\"protocol\" arguments=\"callback-action://done/{token}\"/>\
+               <action content=\"Snooze\" activationType=\"protocol\" arguments=\"callback-action://snooze/{token}\"/>\
+               <action content=\"Not a promise\" activationType=\"protocol\" arguments=\"callback-action://reject/{token}\"/>\
+               <action content=\"Ignore\" activationType=\"protocol\" arguments=\"callback-action://ignore/{token}\"/>\
+             </actions>"
+        )
+    });
+    format!(
+        "<toast><visual><binding template=\"ToastGeneric\">\
+           <text>{title}</text><text>{body}</text>\
+         </binding></visual>{actions}</toast>"
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Removes all Callback notifications from platform history.
+///
+/// # Errors
+///
+/// Returns [`NotifyError::HistoryCleanup`] when Windows Runtime initialization
+/// or Action Center history cleanup fails.
+pub fn clear_callback_history() -> Result<(), NotifyError> {
+    #[cfg(all(target_os = "windows", feature = "windows-platform"))]
+    {
+        windows::clear_callback_history()
+    }
+    #[cfg(not(all(target_os = "windows", feature = "windows-platform")))]
+    {
+        Ok(())
+    }
+}
+
 /// Selects the compiled platform sink.
 #[must_use]
 pub fn platform_sink() -> Box<dyn NotificationSink> {
@@ -69,25 +147,25 @@ pub fn platform_sink() -> Box<dyn NotificationSink> {
 
 #[cfg(all(target_os = "windows", feature = "windows-platform"))]
 mod windows {
-    use super::{NotificationRequest, NotificationSink, NotifyError};
+    use super::{CALLBACK_APP_ID, NotificationRequest, NotificationSink, NotifyError, toast_xml};
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
     use windows::core::HSTRING;
 
     pub struct WindowsToastSink;
 
     impl NotificationSink for WindowsToastSink {
         fn show(&self, request: &NotificationRequest) -> Result<(), NotifyError> {
-            let xml = toast_xml(&request.title, &request.body, &request.action_token);
             let document =
                 XmlDocument::new().map_err(|error| NotifyError::Delivery(error.to_string()))?;
             document
-                .LoadXml(&HSTRING::from(xml))
+                .LoadXml(&HSTRING::from(toast_xml(request)))
                 .map_err(|error| NotifyError::Delivery(error.to_string()))?;
             let toast = ToastNotification::CreateToastNotification(&document)
                 .map_err(|error| NotifyError::Delivery(error.to_string()))?;
             let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
-                "com.callback.desktop",
+                CALLBACK_APP_ID,
             ))
             .map_err(|error| NotifyError::Delivery(error.to_string()))?;
             notifier
@@ -96,28 +174,32 @@ mod windows {
         }
     }
 
-    fn toast_xml(title: &str, body: &str, token: &str) -> String {
-        format!(
-            "<toast launch=\"{token}\">\
-               <visual><binding template=\"ToastGeneric\">\
-                 <text>{}</text><text>{}</text>\
-               </binding></visual>\
-               <actions>\
-                 <action content=\"Done\" arguments=\"done:{token}\"/>\
-                 <action content=\"Snooze\" arguments=\"snooze:{token}\"/>\
-                 <action content=\"Not a promise\" arguments=\"reject:{token}\"/>\
-               </actions>\
-             </toast>",
-            xml_escape(title),
-            xml_escape(body)
-        )
+    pub(super) fn clear_callback_history() -> Result<(), NotifyError> {
+        let _runtime = WinRtInitialization::new()?;
+        let history = ToastNotificationManager::History()
+            .map_err(|error| NotifyError::HistoryCleanup(error.to_string()))?;
+        history
+            .ClearWithId(&HSTRING::from(CALLBACK_APP_ID))
+            .map_err(|error| NotifyError::HistoryCleanup(error.to_string()))
     }
 
-    fn xml_escape(value: &str) -> String {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
+    struct WinRtInitialization;
+
+    impl WinRtInitialization {
+        fn new() -> Result<Self, NotifyError> {
+            // SAFETY: this helper owns the matching RoUninitialize call on the
+            // same thread whenever initialization succeeds.
+            unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
+                .map_err(|error| NotifyError::HistoryCleanup(error.to_string()))?;
+            Ok(Self)
+        }
+    }
+
+    impl Drop for WinRtInitialization {
+        fn drop(&mut self) {
+            // SAFETY: construction succeeded on this thread and each instance
+            // balances exactly one successful RoInitialize call.
+            unsafe { RoUninitialize() };
+        }
     }
 }

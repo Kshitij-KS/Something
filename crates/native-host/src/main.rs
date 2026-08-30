@@ -1,6 +1,6 @@
 #![allow(unsafe_code)]
 
-use callback_native_host::{ALLOWED_ORIGIN, connect_with_backoff, handle_message};
+use callback_native_host::{connect_with_backoff, handle_message};
 use std::io::{self, BufReader, BufWriter};
 use std::time::Duration;
 
@@ -13,26 +13,23 @@ fn main() {
 
 fn run() -> Result<(), callback_protocol::ProtocolError> {
     set_binary_stdio().map_err(|_| callback_protocol::ProtocolError::Io)?;
-    let origin = std::env::args().nth(1).unwrap_or_default();
-    let origin = if origin.is_empty() {
-        ALLOWED_ORIGIN
-    } else {
-        origin.as_str()
-    };
+    let origin = std::env::args().nth(1).ok_or_else(|| {
+        callback_protocol::ProtocolError::UnauthorizedOrigin("missing Chrome origin".into())
+    })?;
     let mut stdin = BufReader::new(io::stdin());
     let mut stdout = BufWriter::new(io::stdout());
     let mut core = connect_with_backoff(20, Duration::from_millis(250), connect_core)?;
     loop {
-        match handle_message(origin, &mut stdin, &mut stdout, &mut core) {
+        match handle_message(&origin, &mut stdin, &mut stdout, &mut core) {
             Ok(()) => {}
-            Err(callback_protocol::ProtocolError::Malformed) => break,
-            Err(callback_protocol::ProtocolError::Io) => {
-                core = connect_with_backoff(20, Duration::from_millis(250), connect_core)?;
-            }
+            // Chrome closes stdin when the native port is gone. A malformed or
+            // truncated frame also terminates this host rather than risking desync.
+            Err(callback_protocol::ProtocolError::Malformed) => return Ok(()),
+            // Exit on core transport loss. The extension retains unacknowledged
+            // captures, observes the native-port disconnect, and reconnects/flushes.
             Err(error) => return Err(error),
         }
     }
-    Ok(())
 }
 
 fn set_binary_stdio() -> io::Result<()> {

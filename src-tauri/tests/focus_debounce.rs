@@ -199,3 +199,29 @@ fn phase0_rule_matches_exe_basename_case_insensitively() {
     let matched = match_phase0(r"C:\Program Files\Slack\slack.exe", &rules).expect("match");
     assert_eq!(matched.reminder_text, "Follow up with Priya");
 }
+
+#[test]
+fn browser_context_transition_restarts_the_dwell() {
+    let mut debounce = FocusDebouncer::new(Duration::from_secs(5));
+    let t0 = Instant::now();
+    let first = FocusTarget {
+        app_id: "chrome.exe".into(),
+        context: Some("slack:D0123".into()),
+    };
+    let second = FocusTarget {
+        app_id: "chrome.exe".into(),
+        context: Some("slack:D0456".into()),
+    };
+
+    debounce.on_os_focus(Some(first), t0);
+    debounce.on_os_focus(Some(second), t0 + Duration::from_secs(2));
+    assert!(debounce.on_tick(t0 + Duration::from_secs(5)).is_pending());
+    let fired = debounce.on_tick(t0 + Duration::from_secs(7));
+    assert_eq!(
+        fired,
+        DebounceOutcome::Fired(FocusTarget {
+            app_id: "chrome.exe".into(),
+            context: Some("slack:D0456".into()),
+        })
+    );
+}

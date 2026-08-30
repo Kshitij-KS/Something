@@ -1,7 +1,7 @@
 use callback_lib::db::Database;
 use callback_lib::domain::{CaptureRecord, LeaseState, PromiseStatus, SurfaceLease};
 use callback_lib::platform::focus::{BrowserContext, FocusTarget, OsFocus, combine_focus};
-use callback_lib::platform::notifications::RecordingSink;
+use callback_lib::platform::notifications::{ACTIONABLE_REMINDER_BODY, RecordingSink, toast_xml};
 use callback_lib::surfacing::engine::{DwellAction, handle_dwell};
 use callback_lib::surfacing::phase0::Phase0Rule;
 use chrono::{Duration, TimeZone, Utc};
@@ -11,7 +11,43 @@ fn open_temp_db() -> (tempfile::TempDir, Database) {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("callback.db");
     let database = Database::open(&path).expect("open database");
+    database
+        .update_kill_gate(
+            "phase0_five_day",
+            "passed",
+            "Five-day local Phase 0 trial passed for this test fixture.",
+        )
+        .expect("phase 0 gate");
+    database
+        .update_kill_gate(
+            "extraction_precision_300",
+            "passed",
+            "Three-hundred-message precision threshold passed for this test fixture.",
+        )
+        .expect("extraction gate");
     (dir, database)
+}
+
+fn open_pending_db() -> (tempfile::TempDir, Database) {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("callback.db");
+    let database = Database::open(&path).expect("open database");
+    (dir, database)
+}
+
+#[test]
+fn pending_extraction_gate_keeps_extracted_promises_notification_silent() {
+    let (_dir, database) = open_pending_db();
+    seed_open_slack_dm(&database, "cap-gated", "I will send the invoice");
+    let sink = RecordingSink::default();
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 27, 12, 0, 0)
+        .single()
+        .expect("now");
+
+    let action = handle_dwell(&database, &sink, &chrome_slack_dm(), now, &[]).expect("dwell");
+    assert_eq!(action, DwellAction::None);
+    assert!(sink.shown().is_empty());
 }
 
 fn seed_open_slack_dm(database: &Database, capture_id: &str, text: &str) -> i64 {
@@ -72,13 +108,19 @@ fn dwell_surfaces_one_extracted_promise_with_crash_safe_token() {
     let shown = sink.shown();
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0].title, "Callback");
-    assert!(shown[0].body.contains("invoice"));
+    assert_eq!(shown[0].body, ACTIONABLE_REMINDER_BODY);
+    assert!(!shown[0].body.contains("invoice"));
+    assert!(!toast_xml(&shown[0]).contains("invoice"));
+    let action_token = shown[0]
+        .action_token
+        .as_deref()
+        .expect("actionable notification");
     let lease = database
-        .lease_by_token_action(&shown[0].action_token)
+        .lease_by_token_action(action_token)
         .expect("lookup")
         .expect("lease");
     assert_eq!(lease.promise_id, promise_id);
-    assert_eq!(lease.action_token, shown[0].action_token);
+    assert_eq!(lease.action_token, action_token);
     assert_eq!(lease.state, LeaseState::Shown);
 }
 
@@ -171,7 +213,7 @@ fn dwell_falls_back_to_phase0_when_no_extracted_match() {
     let action = handle_dwell(&database, &sink, &target, now, &rules).expect("dwell");
     assert_eq!(action, DwellAction::Phase0Shown { rule_id: 9 });
     assert_eq!(sink.shown()[0].body, "Follow up with Priya");
-    assert_eq!(sink.shown()[0].action_token, "phase0:9");
+    assert_eq!(sink.shown()[0].action_token, None);
 }
 
 #[test]
@@ -192,7 +234,7 @@ fn extracted_surface_wins_over_phase0_and_stays_single() {
     let action = handle_dwell(&database, &sink, &chrome_slack_dm(), now, &rules).expect("dwell");
     assert!(matches!(action, DwellAction::ExtractedShown { .. }));
     assert_eq!(sink.shown().len(), 1);
-    assert_ne!(sink.shown()[0].body, "Phase 0 should not fire");
+    assert_eq!(sink.shown()[0].body, ACTIONABLE_REMINDER_BODY);
 }
 
 #[test]

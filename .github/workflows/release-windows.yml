@@ -1,0 +1,111 @@
+name: release-windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_ARTIFACT_NAME: callback-windows-unsigned-${{ github.run_id }}
+
+jobs:
+  release-candidate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npm run stage:native-host
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked -j 1
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run test -- --run
+      - run: npm run validate:extension
+      - run: npm run build
+      - name: Validate extension identity and release versions
+        env:
+          CALLBACK_EXTENSION_ID: ${{ vars.CALLBACK_EXTENSION_ID }}
+        run: npm run verify:release-metadata
+      - run: npm run validate:extension -- extension/dist/manifest.json
+      - run: npm run audit:local-only
+      - name: Verify tag matches the release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Tag $env:GITHUB_REF_NAME does not match package version v$version"
+          }
+      - name: Install NSIS
+        run: choco install nsis --yes --no-progress
+      - name: Bundle unsigned NSIS and MSI installers
+        run: npx --no-install tauri build --bundles nsis,msi
+      - name: Package and verify unsigned artifacts
+        run: npm run package:windows
+      - name: Upload release-candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          if-no-files-found: error
+          path: artifacts/*
+
+  publish-draft:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: release-candidate
+    runs-on: windows-latest
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified release-candidate artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ env.RELEASE_ARTIFACT_NAME }}
+          path: artifacts
+      - name: Reverify checksums without running project code
+        shell: pwsh
+        run: |
+          $sumFile = 'artifacts/SHA256SUMS.txt'
+          if (-not (Test-Path $sumFile -PathType Leaf)) { throw 'Missing SHA256SUMS.txt' }
+          foreach ($line in Get-Content $sumFile) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw 'Malformed checksum entry' }
+            $name = $Matches[2]
+            if ([IO.Path]::GetFileName($name) -ne $name) { throw 'Unsafe checksum path' }
+            $path = Join-Path 'artifacts' $name
+            if (-not (Test-Path $path -PathType Leaf)) { throw "Missing release asset: $name" }
+            $actual = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+            if ($actual -ne $Matches[1]) { throw "Checksum mismatch: $name" }
+          }
+          $assets = @(Get-ChildItem artifacts -File)
+          if ($assets.Count -ne 4) { throw "Expected three assets plus checksums, found $($assets.Count)" }
+      - name: Create draft GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $notes = @"
+          Unsigned release candidate. Windows SmartScreen / Mark-of-the-Web warnings are expected.
+          SHA256SUMS.txt verifies downloaded bytes; it is not a publisher signature.
+          No winget, Scoop, Chrome Web Store publication, or installed-device certification is implied.
+          "@
+          & gh release create $env:GITHUB_REF_NAME --draft --verify-tag --generate-notes --title "Callback $version" --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed' }
+          $assets = @(Get-ChildItem artifacts -File | ForEach-Object FullName)
+          & gh release upload $env:GITHUB_REF_NAME @assets
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release asset upload failed' }

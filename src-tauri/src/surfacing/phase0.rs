@@ -32,11 +32,10 @@ pub fn notify_matched(
     let Some(rule) = match_phase0(app_path, rules) else {
         return Ok(false);
     };
-    sink.show(&NotificationRequest {
-        title: "Callback".into(),
-        body: rule.reminder_text.clone(),
-        action_token: format!("phase0:{}", rule.id),
-    })?;
+    sink.show(&NotificationRequest::informational(
+        "Callback",
+        rule.reminder_text.clone(),
+    ))?;
     Ok(true)
 }
 
