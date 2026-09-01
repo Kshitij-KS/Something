@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "gmail": {
     "sendButton": [
       "[role='button'][aria-label^='Send']",
@@ -11,7 +11,11 @@
     ],
     "composeContainer": ["div[role='dialog']", "div.M9"],
     "toField": ["input[aria-label*='To']", "div[aria-label*='To']"],
-    "successProbe": ["div[aria-live='assertive']"]
+    "successProbe": [
+      "div[aria-live='assertive']",
+      "div[aria-live='polite']",
+      "div[role='alert']"
+    ]
   },
   "slack": {
     "sendButton": [
@@ -19,8 +23,10 @@
       "button[aria-label='Send now']"
     ],
     "composeBody": [
-      "div[data-qa='message_input']",
-      "div[contenteditable='true'][role='textbox']"
+      "div[data-qa='message_input'] [contenteditable='true'][role='textbox']",
+      "div[data-qa='message_input'][contenteditable='true'][role='textbox']",
+      "div[contenteditable='true'][role='textbox']",
+      "div[data-qa='message_input']"
     ],
     "channelContext": [
       "div[data-qa='channel_name']",

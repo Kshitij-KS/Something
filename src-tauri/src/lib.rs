@@ -252,6 +252,10 @@ pub fn run_with_activation(initial_activation: Option<ActionActivation>) {
         })
         .on_window_event(lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
+            commands::list_promises,
+            commands::get_promise,
+            commands::update_promise,
+            commands::act_on_promise,
             commands::list_review,
             commands::review_promise,
             commands::list_phase0,

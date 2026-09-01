@@ -10,6 +10,20 @@ import {
 
 const HOST = "com.callback.host";
 const POLICY_KEY = "callback.sitePolicy";
+const SLACK_CAPTURE_STAGE_KEY = "callback.captureStage.slack";
+const SLACK_CAPTURE_STAGES = new Set([
+  "gesture_seen",
+  "attempt_missing",
+  "attempt_resolved",
+  "intent_ignored",
+  "confirmation_waiting",
+  "body_emptied",
+  "body_detached",
+  "successor_adopted",
+  "confirmation_timeout",
+  "confirm_emitted",
+]);
+const CAPTURE_IGNORE_REASONS = new Set(["empty", "ime", "duplicate"]);
 type Site = "gmail" | "slack";
 type SitePolicy = Record<Site, boolean>;
 
@@ -128,97 +142,149 @@ function senderMatchesSite(site: Site, senderUrl?: string): boolean {
   }
 }
 
-chrome.runtime.onMessage.addListener(
-  (
-    message: {
-      type: string;
-      confirm?: { type: string; key: string };
-      intent?: {
-        sourceApp: Site;
-        sourceCtx?: string;
-        recipient?: string;
-        rawMessage: string;
-      };
-      sourceApp?: Site;
-      sourceCtx?: string;
-      visible?: boolean;
-      active?: boolean;
-      site?: Site;
-      ok?: boolean;
-      missed?: string[];
-    },
-    sender,
-  ) => {
-    if (
-      message.type === "confirm" &&
-      message.confirm?.type === "confirm" &&
-      message.intent &&
-      sitePolicy[message.intent.sourceApp] &&
-      senderMatchesSite(message.intent.sourceApp, sender.tab?.url)
-    ) {
-      const sentAt = Date.now();
-      const item: OutboxItem = {
-        captureId: captureIdFor(message.confirm.key),
-        sourceApp: message.intent.sourceApp,
-        sourceCtx: message.intent.sourceCtx,
-        recipient: message.intent.recipient,
-        rawMessage: message.intent.rawMessage,
-        sentAt,
-        bytes: new TextEncoder().encode(message.intent.rawMessage).length,
-      };
-      void enqueue(item, storage).then(() => flush());
-    }
-    if (
-      message.type === "context" &&
-      message.sourceApp &&
-      sitePolicy[message.sourceApp] &&
-      port &&
-      sender.tab?.active &&
-      senderMatchesSite(message.sourceApp, sender.tab.url)
-    ) {
-      port.postMessage({
-        protocol_version: 1,
-        kind: "context",
-        id: `ctx-${Date.now()}-${sender.tab.id ?? "unknown"}`,
-        payload: {
-          source_app: message.sourceApp,
-          source_ctx: message.sourceCtx,
-          visible: message.visible,
-          active: message.active,
-        },
-      });
-    }
-    if (
-      message.type === "probe" &&
-      message.site &&
-      sitePolicy[message.site] &&
-      senderMatchesSite(message.site, sender.tab?.url)
-    ) {
-      const observedAt = Date.now();
-      void chrome.storage.local.set({
-        [`callback.probe.${message.site}`]: {
-          ok: message.ok,
-          at: observedAt,
-        },
-      });
-      port?.postMessage({
-        protocol_version: 1,
-        kind: "probe",
-        id: `probe-${message.site}-${observedAt}`,
-        payload: {
-          site: message.site,
-          ok: message.ok,
-          missed_count: message.missed?.length ?? 0,
-          observed_at: observedAt,
-        },
-      });
-    }
-  },
-);
+type RuntimeMessage = {
+  type: string;
+  confirm?: { type: string; key: string };
+  intent?: {
+    sourceApp: Site;
+    sourceCtx?: string;
+    recipient?: string;
+    rawMessage: string;
+  };
+  sourceApp?: Site;
+  sourceCtx?: string;
+  visible?: boolean;
+  active?: boolean;
+  site?: Site;
+  ok?: boolean;
+  missed?: string[];
+  stage?: string;
+  at?: number;
+  via?: string;
+  reason?: string;
+  bodyConnected?: boolean;
+  scopeConnected?: boolean;
+};
 
-async function initialize() {
+async function hydrateSitePolicy(): Promise<void> {
   const stored = await storage.get(POLICY_KEY);
   if (isSitePolicy(stored)) sitePolicy = stored;
+}
+
+const policyReady = hydrateSitePolicy().catch(() => undefined);
+
+async function handleRuntimeMessage(
+  message: RuntimeMessage,
+  sender: chrome.runtime.MessageSender,
+): Promise<void> {
+  await policyReady;
+  if (
+    message.type === "confirm" &&
+    message.confirm?.type === "confirm" &&
+    message.intent &&
+    sitePolicy[message.intent.sourceApp] &&
+    senderMatchesSite(message.intent.sourceApp, sender.tab?.url)
+  ) {
+    const sentAt = Date.now();
+    const item: OutboxItem = {
+      captureId: captureIdFor(message.confirm.key),
+      sourceApp: message.intent.sourceApp,
+      sourceCtx: message.intent.sourceCtx,
+      recipient: message.intent.recipient,
+      rawMessage: message.intent.rawMessage,
+      sentAt,
+      bytes: new TextEncoder().encode(message.intent.rawMessage).length,
+    };
+    await enqueue(item, storage);
+    if (message.intent.sourceApp === "slack") {
+      await storage.set(SLACK_CAPTURE_STAGE_KEY, {
+        stage: "background_accepted",
+        at: Date.now(),
+      });
+    }
+    await flush();
+  }
+  if (
+    message.type === "context" &&
+    message.sourceApp &&
+    sitePolicy[message.sourceApp] &&
+    port &&
+    sender.tab?.active &&
+    senderMatchesSite(message.sourceApp, sender.tab.url)
+  ) {
+    port.postMessage({
+      protocol_version: 1,
+      kind: "context",
+      id: `ctx-${Date.now()}-${sender.tab.id ?? "unknown"}`,
+      payload: {
+        source_app: message.sourceApp,
+        source_ctx: message.sourceCtx,
+        visible: message.visible,
+        active: message.active,
+      },
+    });
+  }
+  if (
+    message.type === "captureStage" &&
+    message.site === "slack" &&
+    message.stage &&
+    SLACK_CAPTURE_STAGES.has(message.stage) &&
+    sitePolicy.slack &&
+    senderMatchesSite("slack", sender.tab?.url)
+  ) {
+    const stageRecord: Record<string, string | number | boolean> = {
+      stage: message.stage,
+      at: Date.now(),
+    };
+    if (message.via === "click" || message.via === "keyboard") {
+      stageRecord.via = message.via;
+    }
+    if (message.reason && CAPTURE_IGNORE_REASONS.has(message.reason)) {
+      stageRecord.reason = message.reason;
+    }
+    if (typeof message.bodyConnected === "boolean") {
+      stageRecord.body_connected = message.bodyConnected;
+    }
+    if (typeof message.scopeConnected === "boolean") {
+      stageRecord.scope_connected = message.scopeConnected;
+    }
+    await storage.set(SLACK_CAPTURE_STAGE_KEY, stageRecord);
+  }
+  if (
+    message.type === "probe" &&
+    message.site &&
+    sitePolicy[message.site] &&
+    senderMatchesSite(message.site, sender.tab?.url)
+  ) {
+    const observedAt = Date.now();
+    await storage.set(`callback.probe.${message.site}`, {
+      ok: message.ok,
+      at: observedAt,
+    });
+    port?.postMessage({
+      protocol_version: 1,
+      kind: "probe",
+      id: `probe-${message.site}-${observedAt}`,
+      payload: {
+        site: message.site,
+        ok: message.ok,
+        missed_count: message.missed?.length ?? 0,
+        observed_at: observedAt,
+      },
+    });
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  void handleRuntimeMessage(message as RuntimeMessage, sender).then(
+    () => sendResponse({ ok: true }),
+    () => sendResponse({ ok: false }),
+  );
+  return true;
+});
+
+async function initialize() {
+  await policyReady;
   connect();
 }
 

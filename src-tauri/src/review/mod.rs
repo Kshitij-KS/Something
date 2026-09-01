@@ -327,7 +327,11 @@ fn capture_fingerprint(
         digest.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
         digest.update(bytes);
     }
-    digest.update(sent_at.to_be_bytes());
+    // A manual capture ID is the retry token for user-entered text. Its server-side
+    // receipt must remain stable when an ambiguous IPC result is retried later.
+    if !matches!(source_app, SourceApp::Manual) {
+        digest.update(sent_at.to_be_bytes());
+    }
     let mut encoded = String::with_capacity(64);
     for byte in digest.finalize() {
         let _ = write!(&mut encoded, "{byte:02x}");

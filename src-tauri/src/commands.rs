@@ -1,4 +1,4 @@
-use crate::db::{Database, validate_setting};
+use crate::db::{Database, PromiseDetail, PromiseListScope, PromiseSummary, validate_setting};
 use crate::domain::PromiseStatus;
 use crate::health::{HealthSnapshot, selector_banner, silence_remaining};
 use crate::native_host::autostart::apply_autostart;
@@ -7,8 +7,9 @@ use crate::platform::active_adapter;
 use crate::platform::focus::LiveBrowserContext;
 use crate::review::{ReviewAction, ReviewItem, apply_review, ingest_manual};
 use crate::shortcut::{ShortcutOutcome, ShortcutPlan, open_quick_window, register_on_app};
+use crate::surfacing::actions::{DEFAULT_SNOOZE_SECONDS, SurfaceAction};
 use crate::surfacing::phase0::Phase0Rule;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
@@ -41,6 +42,148 @@ pub struct QuickCaptureResult {
 #[derive(Serialize)]
 pub struct PurgeSchedule {
     pub scheduled: bool,
+}
+
+/// Promise Inbox status projection requested by the desktop UI.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromiseTab {
+    Open,
+    Snoozed,
+    Review,
+    Resolved,
+}
+
+/// Lifecycle action requested from Promise Detail.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromiseInboxAction {
+    Promote,
+    Done,
+    Snooze,
+    NotAPromise,
+    Ignore,
+    Resume,
+}
+
+/// Lists one Promise Inbox tab without exposing raw captured messages.
+#[tauri::command]
+pub fn list_promises(
+    state: State<'_, AppState>,
+    tab: PromiseTab,
+) -> Result<Vec<PromiseSummary>, String> {
+    let scope = match tab {
+        PromiseTab::Open => PromiseListScope::Open,
+        PromiseTab::Snoozed => PromiseListScope::Snoozed,
+        PromiseTab::Review => PromiseListScope::Review,
+        PromiseTab::Resolved => PromiseListScope::Resolved,
+    };
+    let db = state.db.lock().map_err(|_| "db poisoned")?;
+    db.list_promises(scope).map_err(|error| error.to_string())
+}
+
+/// Loads one local Promise Detail record.
+#[tauri::command]
+pub fn get_promise(state: State<'_, AppState>, id: i64) -> Result<Option<PromiseDetail>, String> {
+    let db = state.db.lock().map_err(|_| "db poisoned")?;
+    db.promise_detail(id).map_err(|error| error.to_string())
+}
+
+/// Saves user-editable promise text and an optional absolute deadline.
+#[tauri::command]
+pub fn update_promise(
+    state: State<'_, AppState>,
+    id: i64,
+    expected_status: PromiseStatus,
+    expected_ignore_count: u32,
+    text: String,
+    deadline: Option<i64>,
+    deadline_timezone: Option<String>,
+) -> Result<PromiseDetail, String> {
+    let db = state.db.lock().map_err(|_| "db poisoned")?;
+    db.update_promise_details(
+        id,
+        expected_status,
+        expected_ignore_count,
+        &text,
+        deadline,
+        deadline_timezone.as_deref(),
+        now_unix(),
+    )
+    .map_err(|error| error.to_string())?;
+    required_promise_detail(&db, id)
+}
+
+/// Applies one lifecycle-valid Promise Detail action with stale-snapshot protection.
+#[tauri::command]
+pub fn act_on_promise(
+    state: State<'_, AppState>,
+    id: i64,
+    expected_status: PromiseStatus,
+    expected_ignore_count: u32,
+    action: PromiseInboxAction,
+    snooze_until: Option<i64>,
+) -> Result<PromiseDetail, String> {
+    let db = state.db.lock().map_err(|_| "db poisoned")?;
+    let now = now_unix();
+    match action {
+        PromiseInboxAction::Promote => {
+            if snooze_until.is_some() || expected_status != PromiseStatus::Review {
+                return Err("only a review promise can be promoted".into());
+            }
+            let current = required_promise_detail(&db, id)?;
+            if current.summary.status != expected_status.as_str()
+                || current.summary.ignore_count != expected_ignore_count
+            {
+                return Err("promise changed; refresh and try again".into());
+            }
+            apply_review(&db, id, expected_status, ReviewAction::Promote, "", now)
+                .map_err(|error| error.to_string())?;
+        }
+        PromiseInboxAction::Resume => {
+            if snooze_until.is_some() {
+                return Err("resume does not accept a snooze time".into());
+            }
+            db.wake_snoozed_promise(id, expected_status, expected_ignore_count, now)
+                .map_err(|error| error.to_string())?;
+        }
+        PromiseInboxAction::Done
+        | PromiseInboxAction::Snooze
+        | PromiseInboxAction::NotAPromise
+        | PromiseInboxAction::Ignore => {
+            let surface_action = match action {
+                PromiseInboxAction::Done => SurfaceAction::Done,
+                PromiseInboxAction::Snooze => SurfaceAction::Snooze,
+                PromiseInboxAction::NotAPromise => SurfaceAction::Reject,
+                PromiseInboxAction::Ignore => SurfaceAction::Ignore,
+                PromiseInboxAction::Promote | PromiseInboxAction::Resume => unreachable!(),
+            };
+            let until = if matches!(action, PromiseInboxAction::Snooze) {
+                Some(snooze_until.unwrap_or_else(|| now.saturating_add(DEFAULT_SNOOZE_SECONDS)))
+            } else {
+                if snooze_until.is_some() {
+                    return Err("only snooze accepts a snooze time".into());
+                }
+                None
+            };
+            db.apply_direct_promise_action(
+                id,
+                expected_status,
+                expected_ignore_count,
+                surface_action,
+                now,
+                until,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    required_promise_detail(&db, id)
+}
+
+fn required_promise_detail(db: &Database, id: i64) -> Result<PromiseDetail, String> {
+    db.promise_detail(id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "promise was removed by retention; refresh the inbox".into())
 }
 
 /// Lists review-status promises.

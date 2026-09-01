@@ -342,16 +342,23 @@ impl Database {
                 stored_clauses,
             )) = legacy
             {
+                let is_manual_retry = source_app == "manual"
+                    && matches!(prepared.source_app, crate::domain::SourceApp::Manual);
                 if source_app != prepared.source_app.as_str()
                     || source_ctx.as_deref() != prepared.source_ctx.as_deref()
                     || recipient.as_deref() != prepared.recipient.as_deref()
                     || raw_message != prepared.raw_message
-                    || sent_at != prepared.sent_at
+                    || (!is_manual_retry && sent_at != prepared.sent_at)
                 {
                     return Err(DbError::CaptureConflict {
                         capture_id: prepared.capture_id.clone(),
                     });
                 }
+                let receipt_sent_at = if is_manual_retry {
+                    sent_at
+                } else {
+                    prepared.sent_at
+                };
                 transaction.execute(
                     "INSERT INTO capture_receipts (
                         capture_id, payload_sha256, source_app, sent_at, timezone,
@@ -361,7 +368,7 @@ impl Database {
                         prepared.capture_id,
                         prepared.payload_sha256,
                         prepared.source_app.as_str(),
-                        prepared.sent_at,
+                        receipt_sent_at,
                         prepared.timezone,
                         stored_clauses,
                         created_at,
@@ -1483,7 +1490,26 @@ impl Database {
     ///
     /// Returns [`DbError`] on SQLite failures.
     pub fn insert_phase0_rule(&self, app_match: &str, reminder_text: &str) -> Result<i64, DbError> {
+        let app_match = app_match.trim();
+        let reminder_text = reminder_text.trim();
+        if app_match.is_empty() || reminder_text.is_empty() {
+            return Err(invalid("phase0_rule", "app and reminder text are required"));
+        }
         self.with_writer(|conn| {
+            let existing = match conn.query_row(
+                "SELECT id FROM phase0_rules
+                 WHERE app_match = ?1 COLLATE NOCASE AND reminder_text = ?2
+                 ORDER BY id ASC LIMIT 1",
+                rusqlite::params![app_match, reminder_text],
+                |row| row.get::<_, i64>(0),
+            ) {
+                Ok(id) => Some(id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(DbError::from(error)),
+            };
+            if let Some(id) = existing {
+                return Ok(id);
+            }
             conn.execute(
                 "INSERT INTO phase0_rules (app_match, reminder_text, enabled) VALUES (?1, ?2, 1)",
                 rusqlite::params![app_match, reminder_text],
@@ -1815,7 +1841,445 @@ pub struct PromiseLinkRecord {
     pub text: String,
 }
 
+/// Fixed projections used by the Promise Inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseListScope {
+    Open,
+    Snoozed,
+    Review,
+    Resolved,
+}
+
+/// Content-minimized row shown in the Promise Inbox list.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromiseSummary {
+    pub id: i64,
+    pub text: String,
+    pub status: String,
+    pub source_app: String,
+    pub recipient: Option<String>,
+    pub deadline: Option<i64>,
+    pub snooze_until: Option<i64>,
+    pub ignore_count: u32,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+}
+
+/// One local context that can return a promise to the user.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromiseTriggerSummary {
+    pub kind: String,
+    pub match_value: String,
+    pub priority: i32,
+}
+
+/// Full local detail for one extracted or manual promise.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromiseDetail {
+    #[serde(flatten)]
+    pub summary: PromiseSummary,
+    pub source_ctx: Option<String>,
+    pub sent_at: i64,
+    pub score: i32,
+    pub confidence: f64,
+    pub deadline_tz: Option<String>,
+    pub deadline_precision: Option<String>,
+    pub deadline_escalated_at: Option<i64>,
+    pub surface_count: u32,
+    pub last_shown_at: Option<i64>,
+    pub triggers: Vec<PromiseTriggerSummary>,
+}
+
+fn promise_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PromiseSummary> {
+    let ignore_count: i64 = row.get(7)?;
+    Ok(PromiseSummary {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        status: row.get(2)?,
+        source_app: row.get(3)?,
+        recipient: row.get(4)?,
+        deadline: row.get(5)?,
+        snooze_until: row.get(6)?,
+        ignore_count: u32::try_from(ignore_count).unwrap_or(u32::MAX),
+        created_at: row.get(8)?,
+        resolved_at: row.get(9)?,
+    })
+}
+
 impl Database {
+    /// Lists one deterministic Promise Inbox projection without raw message bodies.
+    pub fn list_promises(&self, scope: PromiseListScope) -> Result<Vec<PromiseSummary>, DbError> {
+        let (filter, ordering) = match scope {
+            PromiseListScope::Open => (
+                "p.status = 'open'",
+                "CASE WHEN p.deadline IS NULL THEN 1 ELSE 0 END, p.deadline ASC, p.created_at DESC, p.id DESC",
+            ),
+            PromiseListScope::Snoozed => (
+                "p.status = 'snoozed'",
+                "p.snooze_until ASC, p.created_at DESC, p.id DESC",
+            ),
+            PromiseListScope::Review => ("p.status = 'review'", "p.created_at ASC, p.id ASC"),
+            PromiseListScope::Resolved => (
+                "p.status IN ('done', 'dismissed', 'archived')",
+                "COALESCE(p.resolved_at, p.created_at) DESC, p.created_at DESC, p.id DESC",
+            ),
+        };
+        self.with_writer(|conn| {
+            let sql = format!(
+                "SELECT p.id, p.text, p.status, p.source_app, p.recipient,
+                        p.deadline, p.snooze_until, p.ignore_count,
+                        p.created_at, p.resolved_at
+                 FROM promises p
+                 WHERE {filter}
+                 ORDER BY {ordering}"
+            );
+            let mut statement = conn.prepare(&sql)?;
+            let rows = statement.query_map([], promise_summary_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(DbError::from)
+        })
+    }
+
+    /// Loads one content-minimized Promise Detail snapshot.
+    pub fn promise_detail(&self, promise_id: i64) -> Result<Option<PromiseDetail>, DbError> {
+        self.with_writer(|conn| {
+            let mut detail = match conn.query_row(
+                "SELECT p.id, p.text, p.status, p.source_app, p.recipient,
+                        p.deadline, p.snooze_until, p.ignore_count,
+                        p.created_at, p.resolved_at, p.source_ctx, p.score,
+                        p.confidence, c.sent_at, p.deadline_tz,
+                        p.deadline_precision, p.deadline_escalated_at,
+                        (SELECT COUNT(*) FROM surface_attempts s
+                         WHERE s.promise_id = p.id AND s.shown_at IS NOT NULL),
+                        (SELECT MAX(shown_at) FROM surface_attempts s WHERE s.promise_id = p.id)
+                 FROM promises p
+                 JOIN captures c
+                   ON c.capture_id = p.capture_id
+                  AND c.clause_ordinal = p.clause_ordinal
+                 WHERE p.id = ?1",
+                [promise_id],
+                |row| {
+                    let surface_count: i64 = row.get(17)?;
+                    Ok(PromiseDetail {
+                        summary: promise_summary_from_row(row)?,
+                        source_ctx: row.get(10)?,
+                        score: row.get(11)?,
+                        confidence: row.get(12)?,
+                        sent_at: row.get(13)?,
+                        deadline_tz: row.get(14)?,
+                        deadline_precision: row.get(15)?,
+                        deadline_escalated_at: row.get(16)?,
+                        surface_count: u32::try_from(surface_count).unwrap_or(u32::MAX),
+                        last_shown_at: row.get(18)?,
+                        triggers: Vec::new(),
+                    })
+                },
+            ) {
+                Ok(detail) => detail,
+                Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+                Err(error) => return Err(DbError::from(error)),
+            };
+            let mut trigger_statement = conn.prepare(
+                "SELECT kind, match_value, priority
+                 FROM triggers
+                 WHERE promise_id = ?1
+                 ORDER BY priority DESC, id ASC",
+            )?;
+            let triggers = trigger_statement.query_map([promise_id], |row| {
+                Ok(PromiseTriggerSummary {
+                    kind: row.get(0)?,
+                    match_value: row.get(1)?,
+                    priority: row.get(2)?,
+                })
+            })?;
+            detail.triggers = triggers
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DbError::from)?;
+            Ok(Some(detail))
+        })
+    }
+
+    /// Returns the current durable status for stale-action protection.
+    pub fn promise_status(&self, promise_id: i64) -> Result<Option<PromiseStatus>, DbError> {
+        self.with_writer(|conn| {
+            let stored = match conn.query_row(
+                "SELECT status FROM promises WHERE id = ?1",
+                [promise_id],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(status) => Some(status),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(error) => return Err(DbError::from(error)),
+            };
+            stored
+                .map(|status| {
+                    PromiseStatus::parse(&status)
+                        .map_err(|reason| invalid("promise_status", &reason))
+                })
+                .transpose()
+        })
+    }
+
+    /// Updates user-editable promise fields while preserving capture evidence and triggers.
+    pub fn update_promise_details(
+        &self,
+        promise_id: i64,
+        expected_status: PromiseStatus,
+        expected_ignore_count: u32,
+        text: &str,
+        deadline: Option<i64>,
+        deadline_timezone: Option<&str>,
+        now_unix: i64,
+    ) -> Result<(), DbError> {
+        if !matches!(
+            expected_status,
+            PromiseStatus::Review | PromiseStatus::Open | PromiseStatus::Snoozed
+        ) {
+            return Err(invalid("promise_status", "resolved promises are read-only"));
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(invalid("promise_text", "text cannot be empty"));
+        }
+        if text.chars().count() > 10_000 {
+            return Err(invalid("promise_text", "text is too long"));
+        }
+        if deadline.is_some_and(|timestamp| timestamp <= 0) {
+            return Err(invalid(
+                "promise_deadline",
+                "deadline must be a valid timestamp",
+            ));
+        }
+        match (deadline, deadline_timezone) {
+            (Some(_), Some(timezone)) if timezone.parse::<chrono_tz::Tz>().is_ok() => {}
+            (Some(_), Some(_)) => {
+                return Err(invalid(
+                    "promise_deadline",
+                    "timezone must be a valid IANA timezone",
+                ));
+            }
+            (Some(_), None) => {
+                return Err(invalid(
+                    "promise_deadline",
+                    "a deadline timezone is required",
+                ));
+            }
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(invalid(
+                    "promise_deadline",
+                    "a cleared deadline cannot include a timezone",
+                ));
+            }
+        }
+        self.with_writer(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let changed = transaction.execute(
+                "UPDATE promises
+                 SET text = ?1,
+                     deadline_tz = CASE
+                         WHEN deadline IS NOT ?2 THEN ?3
+                         ELSE deadline_tz
+                     END,
+                     deadline_precision = CASE
+                         WHEN deadline IS NOT ?2 THEN
+                             CASE WHEN ?2 IS NULL THEN NULL ELSE 'minute' END
+                         ELSE deadline_precision
+                     END,
+                     deadline_escalated_at = CASE
+                         WHEN deadline IS NOT ?2 THEN NULL
+                         ELSE deadline_escalated_at
+                     END,
+                     deadline = ?2
+                 WHERE id = ?4 AND status = ?5 AND ignore_count = ?6",
+                rusqlite::params![
+                    text,
+                    deadline,
+                    deadline_timezone,
+                    promise_id,
+                    expected_status.as_str(),
+                    i64::from(expected_ignore_count),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid(
+                    "promise_status",
+                    "promise changed or was removed; refresh and try again",
+                ));
+            }
+            transaction.execute(
+                "UPDATE surface_attempts
+                 SET state = 'expired',
+                     expires_at = CASE WHEN expires_at > ?2 THEN ?2 ELSE expires_at END
+                 WHERE promise_id = ?1
+                   AND state IN ('leased', 'shown')
+                   AND action IS NULL",
+                rusqlite::params![promise_id, now_unix],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Applies a lifecycle action directly from Promise Detail and invalidates stale toast actions.
+    pub fn apply_direct_promise_action(
+        &self,
+        promise_id: i64,
+        expected_status: PromiseStatus,
+        expected_ignore_count: u32,
+        action: crate::surfacing::actions::SurfaceAction,
+        now_unix: i64,
+        snooze_until: Option<i64>,
+    ) -> Result<PromiseStatus, DbError> {
+        use crate::surfacing::actions::SurfaceAction;
+
+        match (action, snooze_until) {
+            (SurfaceAction::Snooze, Some(until)) if until > now_unix => {}
+            (SurfaceAction::Snooze, _) => {
+                return Err(invalid("snooze", "snooze time must be in the future"));
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(invalid(
+                    "snooze",
+                    "only a snooze action may include a snooze time",
+                ));
+            }
+        }
+
+        self.with_writer(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            let record = match transaction.query_row(
+                "SELECT status, ignore_count, text FROM promises WHERE id = ?1",
+                [promise_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            ) {
+                Ok(record) => record,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(invalid("promise", "promise was not found"));
+                }
+                Err(error) => return Err(DbError::from(error)),
+            };
+            let status = PromiseStatus::parse(&record.0)
+                .map_err(|reason| invalid("promise_status", &reason))?;
+            let ignore_count = u32::try_from(record.1).unwrap_or(u32::MAX);
+            if status != expected_status || ignore_count != expected_ignore_count {
+                return Err(invalid(
+                    "promise_status",
+                    "promise changed; refresh and try again",
+                ));
+            }
+            let event = action.event(ignore_count);
+            let next = crate::domain::apply_promise(status, event).map_err(|_| {
+                invalid(
+                    "promise_action",
+                    "that action is not available for this promise",
+                )
+            })?;
+            let next_ignore_count = if matches!(action, SurfaceAction::Ignore) {
+                record.1.saturating_add(1)
+            } else {
+                record.1
+            };
+            let terminal = matches!(
+                next,
+                PromiseStatus::Done | PromiseStatus::Dismissed | PromiseStatus::Archived
+            );
+            transaction.execute(
+                "UPDATE surface_attempts
+                 SET state = 'expired',
+                     expires_at = CASE WHEN expires_at > ?2 THEN ?2 ELSE expires_at END
+                 WHERE promise_id = ?1
+                   AND state IN ('leased', 'shown')
+                   AND action IS NULL",
+                rusqlite::params![promise_id, now_unix],
+            )?;
+            let changed = transaction.execute(
+                "UPDATE promises
+                 SET status = ?2, ignore_count = ?3, snooze_until = ?4,
+                     resolved_at = CASE WHEN ?5 THEN ?6 ELSE NULL END
+                 WHERE id = ?1 AND status = ?7 AND ignore_count = ?8",
+                rusqlite::params![
+                    promise_id,
+                    next.as_str(),
+                    next_ignore_count,
+                    snooze_until,
+                    terminal,
+                    now_unix,
+                    expected_status.as_str(),
+                    i64::from(expected_ignore_count),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid(
+                    "promise_status",
+                    "promise changed; refresh and try again",
+                ));
+            }
+            if matches!(action, SurfaceAction::Reject) {
+                let pattern = crate::extraction::skeleton(&record.2);
+                transaction.execute(
+                    "INSERT INTO blocklist (pattern, hits, created_at) VALUES (?1, 1, ?2)
+                     ON CONFLICT(pattern) DO UPDATE SET hits = hits + 1",
+                    rusqlite::params![pattern, now_unix],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(next)
+        })
+    }
+
+    /// Returns a snoozed promise to Open while requiring a fresh focus dwell.
+    pub fn wake_snoozed_promise(
+        &self,
+        promise_id: i64,
+        expected_status: PromiseStatus,
+        expected_ignore_count: u32,
+        now_unix: i64,
+    ) -> Result<PromiseStatus, DbError> {
+        let next = crate::domain::apply_promise(
+            expected_status,
+            crate::domain::PromiseEvent::ExpireSnooze,
+        )
+        .map_err(|_| invalid("promise_action", "only snoozed promises can resume"))?;
+        self.with_writer(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute(
+                "UPDATE surface_attempts
+                 SET state = 'expired',
+                     expires_at = CASE WHEN expires_at > ?2 THEN ?2 ELSE expires_at END
+                 WHERE promise_id = ?1
+                   AND state IN ('leased', 'shown')
+                   AND action IS NULL",
+                rusqlite::params![promise_id, now_unix],
+            )?;
+            let changed = transaction.execute(
+                "UPDATE promises
+                 SET status = ?2, snooze_until = NULL, resolved_at = NULL
+                 WHERE id = ?1 AND status = ?3 AND ignore_count = ?4",
+                rusqlite::params![
+                    promise_id,
+                    next.as_str(),
+                    expected_status.as_str(),
+                    i64::from(expected_ignore_count),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(invalid(
+                    "promise_status",
+                    "promise changed; refresh and try again",
+                ));
+            }
+            transaction.commit()?;
+            Ok(next)
+        })
+    }
+
     /// Returns whether a named human-evidence gate has passed.
     pub fn kill_gate_passed(&self, id: &str) -> Result<bool, DbError> {
         self.with_writer(|conn| gate_is_passed(conn, id))
