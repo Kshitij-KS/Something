@@ -1484,12 +1484,51 @@ impl Database {
         })
     }
 
+    /// Sets whether one Phase 0 rule can surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError`] when the id is invalid, the rule is missing, or
+    /// SQLite cannot persist the update.
+    pub fn set_phase0_rule_enabled(
+        &self,
+        id: i64,
+        enabled: bool,
+    ) -> Result<(i64, String, String, bool), DbError> {
+        if id <= 0 {
+            return Err(invalid("phase0_rule", "id must be positive"));
+        }
+        self.with_writer(|conn| {
+            match conn.query_row(
+                "UPDATE phase0_rules
+                 SET enabled = ?1
+                 WHERE id = ?2
+                 RETURNING id, app_match, reminder_text, enabled",
+                rusqlite::params![enabled, id],
+                |row| {
+                    let stored_enabled: i64 = row.get(3)?;
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, stored_enabled != 0))
+                },
+            ) {
+                Ok(rule) => Ok(rule),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    Err(invalid("phase0_rule", "rule was not found"))
+                }
+                Err(error) => Err(DbError::from(error)),
+            }
+        })
+    }
+
     /// Inserts a Phase 0 rule.
     ///
     /// # Errors
     ///
     /// Returns [`DbError`] on SQLite failures.
-    pub fn insert_phase0_rule(&self, app_match: &str, reminder_text: &str) -> Result<i64, DbError> {
+    pub fn insert_phase0_rule(
+        &self,
+        app_match: &str,
+        reminder_text: &str,
+    ) -> Result<(i64, String, String, bool), DbError> {
         let app_match = app_match.trim();
         let reminder_text = reminder_text.trim();
         if app_match.is_empty() || reminder_text.is_empty() {
@@ -1497,24 +1536,33 @@ impl Database {
         }
         self.with_writer(|conn| {
             let existing = match conn.query_row(
-                "SELECT id FROM phase0_rules
+                "SELECT id, app_match, reminder_text, enabled FROM phase0_rules
                  WHERE app_match = ?1 COLLATE NOCASE AND reminder_text = ?2
                  ORDER BY id ASC LIMIT 1",
                 rusqlite::params![app_match, reminder_text],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    let enabled: i64 = row.get(3)?;
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, enabled != 0))
+                },
             ) {
-                Ok(id) => Some(id),
+                Ok(rule) => Some(rule),
                 Err(rusqlite::Error::QueryReturnedNoRows) => None,
                 Err(error) => return Err(DbError::from(error)),
             };
-            if let Some(id) = existing {
-                return Ok(id);
+            if let Some(rule) = existing {
+                return Ok(rule);
             }
-            conn.execute(
-                "INSERT INTO phase0_rules (app_match, reminder_text, enabled) VALUES (?1, ?2, 1)",
+            conn.query_row(
+                "INSERT INTO phase0_rules (app_match, reminder_text, enabled)
+                 VALUES (?1, ?2, 1)
+                 RETURNING id, app_match, reminder_text, enabled",
                 rusqlite::params![app_match, reminder_text],
-            )?;
-            Ok(conn.last_insert_rowid())
+                |row| {
+                    let enabled: i64 = row.get(3)?;
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, enabled != 0))
+                },
+            )
+            .map_err(DbError::from)
         })
     }
 

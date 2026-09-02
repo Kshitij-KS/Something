@@ -1,5 +1,7 @@
 # Callback — Build Spec
 
+> **Historical document:** This file preserves the original product and implementation proposal. It is not the source of truth for the current schema, code, release status, or roadmap. Read [`docs/current-state.md`](docs/current-state.md), [`docs/architecture.md`](docs/architecture.md), and [`docs/roadmap.md`](docs/roadmap.md) for implementation-backed documentation.
+
 **Local-first reminders that fire on context, not clock time.**
 
 ---

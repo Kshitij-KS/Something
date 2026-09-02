@@ -10,9 +10,13 @@ use crate::shortcut::{ShortcutOutcome, ShortcutPlan, open_quick_window, register
 use crate::surfacing::actions::{DEFAULT_SNOOZE_SECONDS, SurfaceAction};
 use crate::surfacing::phase0::Phase0Rule;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, State, WebviewWindow};
+
+const MAIN_WINDOW_LABEL: &str = "main";
+const MAX_TRACKED_PROMISE_ROUTES: usize = 128;
 
 /// Shared runtime state. SQLite writes stay on this mutex.
 pub struct AppState {
@@ -24,6 +28,136 @@ pub struct AppState {
     pub shortcut_status: Arc<Mutex<ShortcutOutcome>>,
     pub live_browser: Arc<Mutex<Option<LiveBrowserContext>>>,
     pub browser_transition_tx: std::sync::mpsc::SyncSender<()>,
+    pub promise_routes: Arc<Mutex<PromiseRouteQueue>>,
+}
+
+/// Content-minimized notification route exposed to the main webview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromiseRouteDto {
+    pub route_id: String,
+    pub promise_id: i64,
+}
+
+/// Privacy-minimized visible app identity exposed only to the main webview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FocusAppDto {
+    pub executable: String,
+}
+
+struct PendingPromiseRoute {
+    route_id: String,
+    promise_id: i64,
+}
+
+#[derive(Default)]
+pub struct PromiseRouteQueue {
+    pending: VecDeque<PendingPromiseRoute>,
+    seen_activation_keys: VecDeque<String>,
+    acknowledged_route_ids: VecDeque<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteEnqueueOutcome {
+    Queued,
+    Duplicate,
+}
+
+impl PromiseRouteQueue {
+    pub fn enqueue(&mut self, promise_id: i64, activation_key: &str) -> RouteEnqueueOutcome {
+        if self
+            .seen_activation_keys
+            .iter()
+            .any(|key| key == activation_key)
+        {
+            return RouteEnqueueOutcome::Duplicate;
+        }
+
+        self.pending.push_back(PendingPromiseRoute {
+            route_id: uuid::Uuid::new_v4().to_string(),
+            promise_id,
+        });
+        if self.seen_activation_keys.len() >= MAX_TRACKED_PROMISE_ROUTES {
+            self.seen_activation_keys.pop_front();
+        }
+        self.seen_activation_keys
+            .push_back(activation_key.to_owned());
+        RouteEnqueueOutcome::Queued
+    }
+
+    fn peek(&self) -> Option<PromiseRouteDto> {
+        self.pending.front().map(|route| PromiseRouteDto {
+            route_id: route.route_id.clone(),
+            promise_id: route.promise_id,
+        })
+    }
+
+    fn acknowledge(&mut self, route_id: &str) -> Result<(), &'static str> {
+        if self
+            .acknowledged_route_ids
+            .iter()
+            .any(|completed| completed == route_id)
+        {
+            return Ok(());
+        }
+        let Some(current) = self.pending.front() else {
+            return Err("no notification route is pending");
+        };
+        if current.route_id != route_id {
+            return Err("notification route changed; retry");
+        }
+        let Some(completed) = self.pending.pop_front() else {
+            return Err("notification route disappeared while acknowledged");
+        };
+        if self.acknowledged_route_ids.len() >= MAX_TRACKED_PROMISE_ROUTES {
+            self.acknowledged_route_ids.pop_front();
+        }
+        self.acknowledged_route_ids.push_back(completed.route_id);
+        Ok(())
+    }
+}
+
+#[must_use]
+pub fn pending_promise_routes() -> Arc<Mutex<PromiseRouteQueue>> {
+    Arc::new(Mutex::new(PromiseRouteQueue::default()))
+}
+
+fn require_main_window(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() == MAIN_WINDOW_LABEL {
+        Ok(())
+    } else {
+        Err("notification routes are only available to the main window".into())
+    }
+}
+
+/// Peeks the FIFO route head without consuming it.
+#[tauri::command]
+pub fn peek_pending_promise_route(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<Option<PromiseRouteDto>, String> {
+    require_main_window(&window)?;
+    let routes = state
+        .promise_routes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(routes.peek())
+}
+
+/// Acknowledges only the current FIFO route after the UI has handled it.
+#[tauri::command]
+pub fn ack_pending_promise_route(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    route_id: String,
+) -> Result<(), String> {
+    require_main_window(&window)?;
+    let mut routes = state
+        .promise_routes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    routes
+        .acknowledge(&route_id)
+        .map_err(std::string::ToString::to_string)
 }
 
 #[derive(Serialize)]
@@ -220,6 +354,19 @@ pub fn review_promise(
     Ok(next.as_str().into())
 }
 
+/// Lists visible top-level Windows apps for the Phase 0 picker.
+#[tauri::command]
+pub fn list_focus_apps(window: WebviewWindow) -> Result<Vec<FocusAppDto>, String> {
+    require_main_window(&window)?;
+    crate::platform::focus::list_focus_apps()
+        .map(|apps| {
+            apps.into_iter()
+                .map(|executable| FocusAppDto { executable })
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
 /// Lists Phase 0 hardcoded rules.
 #[tauri::command]
 pub fn list_phase0(state: State<'_, AppState>) -> Result<Vec<Phase0Rule>, String> {
@@ -238,16 +385,44 @@ pub fn list_phase0(state: State<'_, AppState>) -> Result<Vec<Phase0Rule>, String
         .map_err(|error| error.to_string())
 }
 
+/// Sets whether one Phase 0 rule can surface and returns the stored row.
+#[tauri::command]
+pub fn set_phase0_rule_enabled(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> Result<Phase0Rule, String> {
+    require_main_window(&window)?;
+    let db = state.db.lock().map_err(|_| "db poisoned")?;
+    let (id, app_match, reminder_text, enabled) = db
+        .set_phase0_rule_enabled(id, enabled)
+        .map_err(|error| error.to_string())?;
+    Ok(Phase0Rule {
+        id,
+        app_match,
+        reminder_text,
+        enabled,
+    })
+}
+
 /// Adds a Phase 0 rule.
 #[tauri::command]
 pub fn add_phase0(
     state: State<'_, AppState>,
     app_match: String,
     reminder_text: String,
-) -> Result<i64, String> {
+) -> Result<Phase0Rule, String> {
     let db = state.db.lock().map_err(|_| "db poisoned")?;
-    db.insert_phase0_rule(&app_match, &reminder_text)
-        .map_err(|error| error.to_string())
+    let (id, app_match, reminder_text, enabled) = db
+        .insert_phase0_rule(&app_match, &reminder_text)
+        .map_err(|error| error.to_string())?;
+    Ok(Phase0Rule {
+        id,
+        app_match,
+        reminder_text,
+        enabled,
+    })
 }
 
 /// Quick-capture from the shortcut window. Does not read selected text.

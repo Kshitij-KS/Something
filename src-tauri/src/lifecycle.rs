@@ -1,20 +1,18 @@
 //! Windows desktop lifecycle integration for local notification actions.
 
 use crate::commands::AppState;
-use crate::surfacing::actions::{ActionActivation, dispatch_activation, parse_cold_start_args};
+use crate::surfacing::actions::{ProtocolActivation, dispatch_activation, parse_cold_start_args};
 use chrono::Offset;
 use std::sync::{Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{App, AppHandle, Manager, Runtime, Window, WindowEvent};
-#[cfg(all(debug_assertions, windows))]
-use tauri_plugin_deep_link::DeepLinkExt;
-
+use tauri::{App, AppHandle, Emitter, Manager, Runtime, Window, WindowEvent};
 const MAIN_WINDOW_LABEL: &str = "main";
+const PROMISE_ROUTE_READY_EVENT: &str = "promise-route-ready";
 const TRAY_OPEN_ID: &str = "callback-tray-open";
 const TRAY_QUIT_ID: &str = "callback-tray-quit";
 
-pub type PendingActivations = Arc<Mutex<Vec<ActionActivation>>>;
+pub type PendingActivations = Arc<Mutex<Vec<ProtocolActivation>>>;
 
 #[must_use]
 pub fn pending_activations() -> PendingActivations {
@@ -59,25 +57,11 @@ pub fn single_instance_plugin(
     })
 }
 
-/// Registers configured development schemes. Release installers own installed
-/// protocol registration through `tauri.conf.json`.
-pub fn register_debug_deep_links(app: &App) -> Result<(), String> {
-    #[cfg(all(debug_assertions, windows))]
-    {
-        app.deep_link()
-            .register_all()
-            .map_err(|error| error.to_string())?;
-    }
-    #[cfg(not(all(debug_assertions, windows)))]
-    let _ = app;
-    Ok(())
-}
-
 /// Redeems the cold-start action followed by actions that arrived while setup
 /// was still creating managed state.
 pub fn dispatch_initial_and_pending(
     app: &AppHandle,
-    initial: Option<&ActionActivation>,
+    initial: Option<&ProtocolActivation>,
     pending: &PendingActivations,
 ) {
     if let Some(activation) = initial {
@@ -96,7 +80,11 @@ pub fn dispatch_initial_and_pending(
     }
 }
 
-fn redeem_managed_activation(app: &AppHandle, activation: &ActionActivation, source: &'static str) {
+fn redeem_managed_activation(
+    app: &AppHandle,
+    activation: &ProtocolActivation,
+    source: &'static str,
+) {
     let Some(state) = app.try_state::<AppState>() else {
         tracing::error!(source, "managed state unavailable for Callback action");
         return;
@@ -108,29 +96,75 @@ fn redeem_managed_activation(app: &AppHandle, activation: &ActionActivation, sou
             return;
         }
     };
-    let now_utc = chrono::Utc::now();
-    let now = now_utc.timestamp();
-    let timezone = match db.get_setting("timezone") {
-        Ok(timezone) => timezone
-            .and_then(|value| value.parse::<chrono_tz::Tz>().ok())
-            .unwrap_or(chrono_tz::UTC),
+    let lease = match db.lease_by_token_action(activation.action_token()) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::info!(source, "notification activation token was not recognized");
+            return;
+        }
         Err(error) => {
-            tracing::error!(source, error = %error, "could not load timezone for Callback action");
+            tracing::error!(source, error = %error, "notification route lookup failed");
             return;
         }
     };
-    let offset = now_utc
-        .with_timezone(&timezone)
-        .offset()
-        .fix()
-        .local_minus_utc();
-    let local_day = crate::surfacing::rate_limit::local_day(now_utc, offset);
-    match dispatch_activation(&db, activation, now, &local_day) {
-        Ok(result) => tracing::info!(source, ?result, "notification action handled"),
-        Err(error) => {
-            tracing::error!(source, error = %error, "notification action failed");
+
+    let action_result = match activation {
+        ProtocolActivation::Open { .. } => None,
+        ProtocolActivation::Action(action) => {
+            let now_utc = chrono::Utc::now();
+            let now = now_utc.timestamp();
+            let timezone = match db.get_setting("timezone") {
+                Ok(timezone) => timezone
+                    .and_then(|value| value.parse::<chrono_tz::Tz>().ok())
+                    .unwrap_or(chrono_tz::UTC),
+                Err(error) => {
+                    tracing::error!(source, error = %error, "could not load timezone for Callback action");
+                    return;
+                }
+            };
+            let offset = now_utc
+                .with_timezone(&timezone)
+                .offset()
+                .fix()
+                .local_minus_utc();
+            let local_day = crate::surfacing::rate_limit::local_day(now_utc, offset);
+            match dispatch_activation(&db, action, now, &local_day) {
+                Ok(result) => Some(result),
+                Err(error) => {
+                    tracing::error!(source, error = %error, "notification action failed");
+                    return;
+                }
+            }
         }
+    };
+    let promise_id = lease.promise_id;
+    drop(db);
+
+    if let Some(result) = action_result {
+        tracing::info!(source, ?result, "notification action handled");
+    } else {
+        tracing::info!(source, "notification opened without mutating its promise");
     }
+
+    let route_key = match activation {
+        ProtocolActivation::Open { .. } => format!("open:{}", activation.action_token()),
+        ProtocolActivation::Action(_) => format!("action:{}", activation.action_token()),
+    };
+    let enqueue_outcome = {
+        let mut routes = state
+            .promise_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        routes.enqueue(promise_id, &route_key)
+    };
+
+    if let Err(error) = show_main_window(app) {
+        tracing::warn!(source, error = %error, "could not foreground Callback notification route");
+    }
+    if let Err(error) = app.emit_to(MAIN_WINDOW_LABEL, PROMISE_ROUTE_READY_EVENT, ()) {
+        tracing::warn!(source, error = %error, "could not signal pending notification route");
+    }
+    tracing::debug!(source, ?enqueue_outcome, "notification route queued");
 }
 
 /// Shows, restores, and focuses the configured main window.

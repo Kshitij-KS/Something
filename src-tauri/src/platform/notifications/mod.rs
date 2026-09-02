@@ -88,19 +88,27 @@ impl NotificationSink for RecordingSink {
 pub fn toast_xml(request: &NotificationRequest) -> String {
     let title = xml_escape(&request.title);
     let body = xml_escape(&request.body);
-    let actions = request.action_token.as_ref().map_or_else(String::new, |token| {
-        let token = xml_escape(token);
-        format!(
-            "<actions>\
-               <action content=\"Done\" activationType=\"protocol\" arguments=\"callback-action://done/{token}\"/>\
-               <action content=\"Snooze\" activationType=\"protocol\" arguments=\"callback-action://snooze/{token}\"/>\
-               <action content=\"Not a promise\" activationType=\"protocol\" arguments=\"callback-action://reject/{token}\"/>\
-               <action content=\"Ignore\" activationType=\"protocol\" arguments=\"callback-action://ignore/{token}\"/>\
-             </actions>"
-        )
-    });
+    let (launch, actions) = request.action_token.as_ref().map_or_else(
+        || (String::new(), String::new()),
+        |token| {
+            let token = xml_escape(token);
+            (
+                format!(
+                    " activationType=\"protocol\" launch=\"callback-action://open/{token}\""
+                ),
+                format!(
+                    "<actions>\
+                       <action content=\"Done\" activationType=\"protocol\" arguments=\"callback-action://done/{token}\"/>\
+                       <action content=\"Snooze\" activationType=\"protocol\" arguments=\"callback-action://snooze/{token}\"/>\
+                       <action content=\"Not a promise\" activationType=\"protocol\" arguments=\"callback-action://reject/{token}\"/>\
+                       <action content=\"Ignore\" activationType=\"protocol\" arguments=\"callback-action://ignore/{token}\"/>\
+                     </actions>"
+                ),
+            )
+        },
+    );
     format!(
-        "<toast><visual><binding template=\"ToastGeneric\">\
+        "<toast{launch}><visual><binding template=\"ToastGeneric\">\
            <text>{title}</text><text>{body}</text>\
          </binding></visual>{actions}</toast>"
     )

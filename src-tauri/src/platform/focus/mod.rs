@@ -288,6 +288,15 @@ pub fn combine_live_focus(
     Some(target)
 }
 
+/// Lists visible top-level app executable basenames without retaining paths or titles.
+///
+/// # Errors
+///
+/// Returns [`FocusError`] when the platform cannot enumerate app windows.
+pub fn list_focus_apps() -> Result<Vec<String>, FocusError> {
+    sys::list_focus_apps()
+}
+
 /// Resolves a PID to an image path without panicking on access denial.
 ///
 /// # Errors

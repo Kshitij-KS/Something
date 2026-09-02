@@ -22,7 +22,7 @@ use crate::platform::focus::{
     combine_live_focus, parse_browser_context,
 };
 use crate::shortcut::{ShortcutOutcome, ShortcutPlan};
-use crate::surfacing::actions::ActionActivation;
+use crate::surfacing::actions::ProtocolActivation;
 use crate::surfacing::engine::{handle_dwell, handle_maintenance_tick};
 use crate::surfacing::phase0::Phase0Rule;
 use callback_protocol::MessageKind;
@@ -44,15 +44,13 @@ pub fn run() {
 
 /// Starts the desktop runtime and redeems an optional cold-start action after
 /// the database has been recovered.
-pub fn run_with_activation(initial_activation: Option<ActionActivation>) {
+pub fn run_with_activation(initial_activation: Option<ProtocolActivation>) {
     let pending_activations = lifecycle::pending_activations();
     let pending_for_setup = Arc::clone(&pending_activations);
     tauri::Builder::default()
         .plugin(lifecycle::single_instance_plugin(pending_activations))
-        .plugin(tauri_plugin_deep_link::init())
         .plugin(crate::shortcut::plugin())
         .setup(move |app| {
-            lifecycle::register_debug_deep_links(app).map_err(std::io::Error::other)?;
             platform::active_adapter().initialize()?;
             let app_dir = app
                 .path()
@@ -228,6 +226,7 @@ pub fn run_with_activation(initial_activation: Option<ActionActivation>) {
                 shortcut_status: Arc::clone(&shortcut_status),
                 live_browser: Arc::clone(&live_browser),
                 browser_transition_tx,
+                promise_routes: commands::pending_promise_routes(),
             });
             lifecycle::dispatch_initial_and_pending(
                 app.handle(),
@@ -252,13 +251,17 @@ pub fn run_with_activation(initial_activation: Option<ActionActivation>) {
         })
         .on_window_event(lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
+            commands::peek_pending_promise_route,
+            commands::ack_pending_promise_route,
             commands::list_promises,
             commands::get_promise,
             commands::update_promise,
             commands::act_on_promise,
             commands::list_review,
             commands::review_promise,
+            commands::list_focus_apps,
             commands::list_phase0,
+            commands::set_phase0_rule_enabled,
             commands::add_phase0,
             commands::quick_capture,
             commands::save_setting,
@@ -336,8 +339,8 @@ fn run_surface_maintenance(
                     "due snoozes reopened; pending dwell cancelled"
                 );
             }
-            if let Some(action) = result.deadline_surface {
-                tracing::debug!(?action, "deadline maintenance evaluated a surface");
+            if result.deadline_surface.is_some() {
+                tracing::debug!("deadline maintenance evaluated a surface");
             }
         }
         Err(error) => {

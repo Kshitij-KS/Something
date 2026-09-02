@@ -11,6 +11,7 @@ import {
   type CallbackPromiseDetail,
   type CallbackPromiseSummary,
   type PromiseInboxAction,
+  type PromiseRouteRequest,
   type PromiseTab,
 } from "../promises";
 import { PromiseDetail } from "./PromiseDetail";
@@ -21,7 +22,9 @@ export type PromiseInboxInteractionState = {
 };
 
 type PromiseInboxProps = {
+  routeRequest?: PromiseRouteRequest | null;
   onInteractionStateChange?: (state: PromiseInboxInteractionState) => void;
+  onRouteHandled?: (routeId: string) => Promise<void>;
 };
 
 type ListState = "loading" | "ready" | "error";
@@ -37,13 +40,20 @@ const CLEAN_INTERACTION_STATE: PromiseInboxInteractionState = {
   dirty: false,
 };
 
-export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
+export function PromiseInbox({
+  routeRequest = null,
+  onInteractionStateChange,
+  onRouteHandled,
+}: PromiseInboxProps) {
   const [tab, setTab] = useState<PromiseTab>("open");
   const [items, setItems] = useState<CallbackPromiseSummary[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [detailState, setDetailState] = useState<DetailState>({ kind: "idle" });
   const [listState, setListState] = useState<ListState>("loading");
   const [pending, setPending] = useState(false);
+  const [routeLoading, setRouteLoading] = useState(false);
+  const [deferredRouteId, setDeferredRouteId] = useState<string | null>(null);
+  const [routeRetryKey, setRouteRetryKey] = useState(0);
   const [dirty, setDirty] = useState(false);
   const [listRefreshKey, setListRefreshKey] = useState(0);
   const [detailRefreshKey, setDetailRefreshKey] = useState(0);
@@ -52,6 +62,12 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
   const [message, setMessage] = useState<string | null>(null);
   const mutationGeneration = useRef(0);
   const activeMutation = useRef<number | null>(null);
+  const navigationGeneration = useRef(0);
+  const routeOperationGeneration = useRef(0);
+  const activeRouteId = useRef<string | null>(null);
+  const completedRouteId = useRef<string | null>(null);
+  const routeRequestIdRef = useRef<string | null>(null);
+  const hydratedRouteDetailId = useRef<number | null>(null);
   const mounted = useRef(true);
   const dirtyRef = useRef(false);
   const selectedIdRef = useRef<number | null>(null);
@@ -62,9 +78,15 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
     Partial<Record<PromiseTab, HTMLButtonElement | null>>
   >({});
 
+  useEffect(() => {
+    routeRequestIdRef.current = routeRequest?.route_id ?? null;
+  }, [routeRequest]);
+
   const detail = detailState.kind === "ready" ? detailState.detail : null;
   const detailLoading = detailState.kind === "loading";
-  const workspaceBusy = listState === "loading" || detailLoading || pending;
+  const navigationBusy = pending || routeLoading;
+  const workspaceBusy =
+    listState === "loading" || detailLoading || navigationBusy;
 
   const updateSelectedId = useCallback((id: number | null) => {
     selectedIdRef.current = id;
@@ -74,6 +96,11 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
   const updateTab = useCallback((nextTab: PromiseTab) => {
     tabRef.current = nextTab;
     setTab(nextTab);
+  }, []);
+
+  const updateDirty = useCallback((next: boolean) => {
+    dirtyRef.current = next;
+    setDirty(next);
   }, []);
 
   const scheduleFocus = useCallback((target: () => HTMLElement | null) => {
@@ -100,14 +127,17 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
     return () => {
       mounted.current = false;
       activeMutation.current = null;
+      activeRouteId.current = null;
       mutationGeneration.current += 1;
+      navigationGeneration.current += 1;
+      routeOperationGeneration.current += 1;
       deferredFocusGeneration.current += 1;
     };
   }, []);
 
   useEffect(() => {
-    onInteractionStateChange?.({ busy: pending, dirty });
-  }, [dirty, onInteractionStateChange, pending]);
+    onInteractionStateChange?.({ busy: navigationBusy, dirty });
+  }, [dirty, navigationBusy, onInteractionStateChange]);
 
   useEffect(
     () => () => onInteractionStateChange?.(CLEAN_INTERACTION_STATE),
@@ -116,12 +146,19 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
 
   useEffect(() => {
     const requestedTab = tab;
+    const requestedNavigation = navigationGeneration.current;
     let cancelled = false;
     void invoke<CallbackPromiseSummary[]>("list_promises", {
       tab: requestedTab,
     })
       .then((next) => {
-        if (cancelled || tabRef.current !== requestedTab) return;
+        if (
+          cancelled ||
+          tabRef.current !== requestedTab ||
+          navigationGeneration.current !== requestedNavigation
+        ) {
+          return;
+        }
         if (dirtyRef.current) {
           setListState("ready");
           setMessage(
@@ -146,7 +183,13 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
         setListState("ready");
       })
       .catch((reason: unknown) => {
-        if (cancelled || tabRef.current !== requestedTab) return;
+        if (
+          cancelled ||
+          tabRef.current !== requestedTab ||
+          navigationGeneration.current !== requestedNavigation
+        ) {
+          return;
+        }
         setListState("error");
         setError(String(reason));
       });
@@ -157,9 +200,14 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
 
   useEffect(() => {
     if (selectedId === null) return;
+    if (hydratedRouteDetailId.current === selectedId) {
+      hydratedRouteDetailId.current = null;
+      return;
+    }
 
     const requestedId = selectedId;
     const requestedTab = tabRef.current;
+    const requestedNavigation = navigationGeneration.current;
     let cancelled = false;
     void invoke<CallbackPromiseDetail | null>("get_promise", {
       id: requestedId,
@@ -168,7 +216,8 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
         if (
           cancelled ||
           selectedIdRef.current !== requestedId ||
-          tabRef.current !== requestedTab
+          tabRef.current !== requestedTab ||
+          navigationGeneration.current !== requestedNavigation
         ) {
           return;
         }
@@ -202,7 +251,8 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
         if (
           cancelled ||
           selectedIdRef.current !== requestedId ||
-          tabRef.current !== requestedTab
+          tabRef.current !== requestedTab ||
+          navigationGeneration.current !== requestedNavigation
         ) {
           return;
         }
@@ -217,17 +267,149 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
     };
   }, [detailRefreshKey, selectedId, updateSelectedId]);
 
-  const updateDirty = useCallback((next: boolean) => {
-    dirtyRef.current = next;
-    setDirty(next);
-  }, []);
+  useEffect(() => {
+    if (
+      routeRequest === null ||
+      onRouteHandled === undefined ||
+      completedRouteId.current === routeRequest.route_id ||
+      activeRouteId.current === routeRequest.route_id ||
+      deferredRouteId === routeRequest.route_id ||
+      activeMutation.current !== null
+    ) {
+      return;
+    }
+
+    if (
+      dirtyRef.current &&
+      !window.confirm(
+        "Discard the unsaved changes and open the reminder you clicked?",
+      )
+    ) {
+      setDeferredRouteId(routeRequest.route_id);
+      setMessage(null);
+      setError(null);
+      return;
+    }
+
+    const routeId = routeRequest.route_id;
+    const promiseId = routeRequest.promise_id;
+    const routeStartNavigation = navigationGeneration.current;
+    const operationGeneration = routeOperationGeneration.current + 1;
+    routeOperationGeneration.current = operationGeneration;
+    activeRouteId.current = routeId;
+    deferredFocusGeneration.current += 1;
+    setRouteLoading(true);
+    setMessage(null);
+    setError(null);
+
+    const ownsRouteOperation = (requireCurrentRequest = true) =>
+      mounted.current &&
+      routeOperationGeneration.current === operationGeneration &&
+      activeRouteId.current === routeId &&
+      (!requireCurrentRequest || routeRequestIdRef.current === routeId);
+
+    let cancelled = false;
+    void invoke<CallbackPromiseDetail | null>("get_promise", { id: promiseId })
+      .then(async (next) => {
+        if (
+          cancelled ||
+          !ownsRouteOperation() ||
+          navigationGeneration.current !== routeStartNavigation
+        ) {
+          return;
+        }
+
+        if (!next) {
+          setMessage(
+            "That clicked reminder is no longer available. Your current work was kept.",
+          );
+        } else {
+          navigationGeneration.current += 1;
+          const previousTab = tabRef.current;
+          const targetTab = tabForStatus(next.status);
+          const selectionChanged = selectedIdRef.current !== next.id;
+          if (selectionChanged) hydratedRouteDetailId.current = next.id;
+          updateDirty(false);
+          updateTab(targetTab);
+          updateSelectedId(next.id);
+          setItems((current) => {
+            if (previousTab !== targetTab) return [next];
+            return current.some((item) => item.id === next.id)
+              ? current.map((item) => (item.id === next.id ? next : item))
+              : [next, ...current];
+          });
+          setDetailState({ kind: "ready", detail: next });
+          setEditorGeneration((current) => current + 1);
+          setMessage("Opened the reminder you clicked.");
+          setListState("loading");
+          setListRefreshKey((current) => current + 1);
+          scheduleFocus(
+            () =>
+              editorFocusRef.current ?? tabButtons.current[targetTab] ?? null,
+          );
+        }
+
+        completedRouteId.current = routeId;
+        try {
+          await onRouteHandled(routeId);
+          if (!ownsRouteOperation()) return;
+          setDeferredRouteId(null);
+        } catch (reason: unknown) {
+          if (!ownsRouteOperation()) return;
+          completedRouteId.current = null;
+          setDeferredRouteId(routeId);
+          setError(
+            `Could not finish the clicked reminder route: ${String(reason)}`,
+          );
+        }
+      })
+      .catch((reason: unknown) => {
+        if (
+          cancelled ||
+          !ownsRouteOperation() ||
+          navigationGeneration.current !== routeStartNavigation
+        ) {
+          return;
+        }
+        setDeferredRouteId(routeId);
+        setError(`Could not open the clicked reminder: ${String(reason)}`);
+      })
+      .finally(() => {
+        if (ownsRouteOperation(false)) {
+          activeRouteId.current = null;
+          setRouteLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    deferredRouteId,
+    onRouteHandled,
+    pending,
+    routeRequest,
+    routeRetryKey,
+    scheduleFocus,
+    updateDirty,
+    updateSelectedId,
+    updateTab,
+  ]);
 
   const confirmDiscard = () =>
     !dirtyRef.current ||
     window.confirm("Discard the unsaved changes to this promise and continue?");
 
   const refresh = () => {
-    if (activeMutation.current !== null || !confirmDiscard()) return;
+    if (
+      activeMutation.current !== null ||
+      activeRouteId.current !== null ||
+      !confirmDiscard()
+    ) {
+      return;
+    }
+    navigationGeneration.current += 1;
+    hydratedRouteDetailId.current = null;
     deferredFocusGeneration.current += 1;
     updateDirty(false);
     setMessage(null);
@@ -241,8 +423,16 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
   };
 
   const chooseTab = (nextTab: PromiseTab) => {
-    if (activeMutation.current !== null || nextTab === tab) return;
+    if (
+      activeMutation.current !== null ||
+      activeRouteId.current !== null ||
+      nextTab === tab
+    ) {
+      return;
+    }
     if (!confirmDiscard()) return;
+    navigationGeneration.current += 1;
+    hydratedRouteDetailId.current = null;
     deferredFocusGeneration.current += 1;
     updateDirty(false);
     updateTab(nextTab);
@@ -255,10 +445,13 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
   };
 
   const choosePromise = (id: number) => {
-    if (activeMutation.current !== null) return;
+    if (activeMutation.current !== null || activeRouteId.current !== null)
+      return;
     deferredFocusGeneration.current += 1;
     if (id === selectedId) {
       if (detailState.kind === "error") {
+        navigationGeneration.current += 1;
+        hydratedRouteDetailId.current = null;
         setMessage(null);
         setError(null);
         setDetailState({ kind: "loading", id });
@@ -267,6 +460,8 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
       return;
     }
     if (!confirmDiscard()) return;
+    navigationGeneration.current += 1;
+    hydratedRouteDetailId.current = null;
     updateDirty(false);
     updateSelectedId(id);
     setDetailState({ kind: "loading", id });
@@ -274,8 +469,58 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
     setError(null);
   };
 
+  const retryDeferredRoute = () => {
+    if (!routeRequest || navigationBusy) return;
+    setDeferredRouteId(null);
+    setError(null);
+    setRouteRetryKey((current) => current + 1);
+  };
+
+  const dismissDeferredRoute = async () => {
+    if (
+      !routeRequest ||
+      onRouteHandled === undefined ||
+      navigationBusy ||
+      deferredRouteId !== routeRequest.route_id
+    ) {
+      return;
+    }
+    const routeId = routeRequest.route_id;
+    const operationGeneration = routeOperationGeneration.current + 1;
+    routeOperationGeneration.current = operationGeneration;
+    activeRouteId.current = routeId;
+    setRouteLoading(true);
+    setError(null);
+
+    const ownsRouteOperation = (requireCurrentRequest = true) =>
+      mounted.current &&
+      routeOperationGeneration.current === operationGeneration &&
+      activeRouteId.current === routeId &&
+      (!requireCurrentRequest || routeRequestIdRef.current === routeId);
+
+    try {
+      await onRouteHandled(routeId);
+      if (!ownsRouteOperation()) return;
+      completedRouteId.current = routeId;
+      setDeferredRouteId(null);
+      setMessage("Clicked reminder dismissed.");
+    } catch (reason: unknown) {
+      if (!ownsRouteOperation()) return;
+      setError(`Could not dismiss the clicked reminder: ${String(reason)}`);
+    } finally {
+      if (ownsRouteOperation(false)) {
+        activeRouteId.current = null;
+        setRouteLoading(false);
+      }
+    }
+  };
+
   const beginMutation = (): number | null => {
-    if (activeMutation.current !== null) return null;
+    if (activeMutation.current !== null || activeRouteId.current !== null) {
+      return null;
+    }
+    navigationGeneration.current += 1;
+    hydratedRouteDetailId.current = null;
     deferredFocusGeneration.current += 1;
     const generation = mutationGeneration.current + 1;
     mutationGeneration.current = generation;
@@ -322,7 +567,11 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
       setListRefreshKey((current) => current + 1);
       scheduleFocus(() => editorFocusRef.current);
     } catch (reason: unknown) {
-      if (isCurrentMutation(generation)) setError(String(reason));
+      if (isCurrentMutation(generation)) {
+        setError(String(reason));
+        setListState("loading");
+        setListRefreshKey((current) => current + 1);
+      }
     } finally {
       finishMutation(generation);
     }
@@ -359,13 +608,19 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
       setListRefreshKey((current) => current + 1);
       scheduleFocus(() => tabButtons.current[nextTab] ?? null);
     } catch (reason: unknown) {
-      if (isCurrentMutation(generation)) setError(String(reason));
+      if (isCurrentMutation(generation)) {
+        setError(String(reason));
+        setListState("loading");
+        setListRefreshKey((current) => current + 1);
+      }
     } finally {
       finishMutation(generation);
     }
   };
 
   const activeTab = PROMISE_TABS.find((item) => item.id === tab);
+  const routeDeferred =
+    routeRequest !== null && deferredRouteId === routeRequest.route_id;
 
   return (
     <section className="promise-page" aria-labelledby="promises-heading">
@@ -381,7 +636,7 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
         <button
           type="button"
           className="button-quiet"
-          disabled={pending}
+          disabled={navigationBusy}
           onClick={refresh}
         >
           Refresh
@@ -398,7 +653,7 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
             type="button"
             aria-pressed={tab === item.id}
             className={tab === item.id ? "active" : ""}
-            disabled={pending}
+            disabled={navigationBusy}
             onClick={() => chooseTab(item.id)}
           >
             {item.label}
@@ -406,6 +661,35 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
         ))}
       </div>
 
+      {routeDeferred ? (
+        <div
+          className="inline-notice route-notice"
+          role="status"
+          aria-live="polite"
+        >
+          <span>
+            A clicked reminder is waiting. Your current work is unchanged.
+          </span>
+          <div className="route-notice-actions">
+            <button
+              type="button"
+              className="button-secondary"
+              disabled={navigationBusy}
+              onClick={retryDeferredRoute}
+            >
+              Open reminder
+            </button>
+            <button
+              type="button"
+              className="button-quiet"
+              disabled={navigationBusy}
+              onClick={() => void dismissDeferredRoute()}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      ) : null}
       {message ? (
         <p className="inline-notice success" role="status" aria-live="polite">
           {message}
@@ -445,7 +729,7 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
                   type="button"
                   className={selectedId === item.id ? "selected" : ""}
                   aria-current={selectedId === item.id ? "true" : undefined}
-                  disabled={pending}
+                  disabled={navigationBusy}
                   onClick={() => choosePromise(item.id)}
                 >
                   <span className="promise-list-topline">
@@ -475,7 +759,7 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
               <button
                 type="button"
                 className="button-secondary"
-                disabled={pending}
+                disabled={navigationBusy}
                 onClick={() => choosePromise(detailState.id)}
               >
                 Try again
@@ -493,7 +777,7 @@ export function PromiseInbox({ onInteractionStateChange }: PromiseInboxProps) {
             <PromiseDetail
               key={`${detail.id}:${editorGeneration}`}
               detail={detail}
-              pending={pending}
+              pending={navigationBusy}
               editorFocusRef={editorFocusRef}
               onAction={act}
               onDirtyChange={updateDirty}

@@ -6,6 +6,11 @@ export type PromiseTab = "open" | "snoozed" | "review" | "resolved";
 export type PromiseInboxAction =
   "promote" | "done" | "snooze" | "not_a_promise" | "ignore" | "resume";
 
+export type PromiseRouteRequest = {
+  route_id: string;
+  promise_id: number;
+};
+
 export type CallbackPromiseSummary = {
   id: number;
   text: string;

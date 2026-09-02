@@ -435,10 +435,12 @@ fn action_parser_and_toast_xml_are_strict_and_content_safe() {
         assert_eq!(
             parse_action_argument(&format!("callback-action://{verb}/{token}"))
                 .expect("parse action"),
-            Some(ActionActivation {
-                action,
-                action_token: token.into(),
-            })
+            Some(
+                callback_lib::surfacing::actions::ProtocolActivation::Action(ActionActivation {
+                    action,
+                    action_token: token.into(),
+                },),
+            )
         );
     }
     assert_eq!(parse_action_argument("--purge").expect("unrelated"), None);
@@ -470,7 +472,8 @@ fn action_parser_and_toast_xml_are_strict_and_content_safe() {
     let actionable = NotificationRequest::actionable(token);
     let xml = toast_xml(&actionable);
     assert!(xml.contains(ACTIONABLE_REMINDER_BODY));
-    assert_eq!(xml.matches("activationType=\"protocol\"").count(), 4);
+    assert_eq!(xml.matches("activationType=\"protocol\"").count(), 5);
+    assert!(xml.contains("callback-action://open/"));
     assert!(xml.contains("callback-action://ignore/"));
     let informational = toast_xml(&NotificationRequest::informational("Callback", "Phase 0"));
     assert!(!informational.contains("<actions>"));
